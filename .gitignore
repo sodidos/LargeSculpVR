@@ -1,0 +1,39 @@
+# Build outputs
+build/
+build-*/
+out/
+
+# CMake / Visual Studio
+.vs/
+CMakeFiles/
+CMakeCache.txt
+cmake_install.cmake
+*.sln
+*.vcxproj
+*.vcxproj.filters
+*.vcxproj.user
+
+# Android / Gradle
+quest/.gradle/
+quest/app/.cxx/
+quest/app/build/
+quest/local.properties
+
+# Native build artifacts
+*.apk
+*.aab
+*.so
+*.dll
+*.exe
+*.obj
+*.pdb
+*.ilk
+*.lib
+
+# Editor / OS noise
+.idea/
+.vscode/
+*.swp
+*.tmp
+Thumbs.db
+Desktop.ini
