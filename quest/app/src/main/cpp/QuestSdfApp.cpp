@@ -1739,6 +1739,7 @@ class QuestSdfApp {
     stretchAnchorSet_ = false;
     stretchPullActive_ = false;
     stretchPullStartToolOrientationLocal_ = {0.0f, 0.0f, 0.0f, 1.0f};
+    stretchUploadBounds_ = {};
     rightHandPinchStretchActive_ = false;
     rightHandPinchWasActive_ = false;
     rightHandPinchToolActive_ = false;
@@ -2481,6 +2482,7 @@ class QuestSdfApp {
       stretchSourceVolume_ = volume_;
       stretchPullStartControllerLocal_ = toolCenterLocal;
       stretchPullStartToolOrientationLocal_ = toolOrientationLocal;
+      stretchUploadBounds_ = {};
       stretchPullActive_ = true;
       brushHitWorld_ = objectToWorldPoint(stretchAnchorLocal_);
       logInfo("Stretch anchor set: (%.2f %.2f %.2f)",
@@ -2512,6 +2514,7 @@ class QuestSdfApp {
     const bool moved = large::sdf::length(delta) > volume_.voxelSize() * 0.35f;
     const bool rotated = rotationAngle * influenceRadius > volume_.voxelSize() * 0.35f;
     if ((moved || rotated) && frameCounter_ >= nextSculptFrame_) {
+      const large::sdf::VoxelBounds previousStretchBounds = stretchUploadBounds_;
       volume_.applyStretchBrush(stretchSourceVolume_,
                                 stretchAnchorLocal_,
                                 delta,
@@ -2520,7 +2523,9 @@ class QuestSdfApp {
                                 rotationZ,
                                 influenceRadius,
                                 brushStrength_);
-      uploadSdfTexture();
+      const large::sdf::VoxelBounds currentStretchBounds = volume_.dirtyBounds();
+      uploadSdfTexture(previousStretchBounds);
+      stretchUploadBounds_ = currentStretchBounds;
       nextSculptFrame_ = frameCounter_ + 2;
       if (frameCounter_ >= nextSculptLogFrame_) {
         logInfo("VR Stretch brush: delta=(%.2f %.2f %.2f), rot=%.1fdeg, radius=%.2f strength=%.2f",
@@ -2652,6 +2657,7 @@ class QuestSdfApp {
       stretchAnchorSet_ = true;
       stretchSourceVolume_ = volume_;
       stretchPullStartControllerLocal_ = pinchLocal;
+      stretchUploadBounds_ = {};
       rightHandPinchStretchActive_ = true;
       rightHandPinchWasActive_ = true;
       logInfo("Hand Stretch anchor set: (%.2f %.2f %.2f)",
@@ -2667,8 +2673,11 @@ class QuestSdfApp {
     brushHitLocal_ = stretchAnchorLocal_ + delta;
     brushHitWorld_ = objectToWorldPoint(brushHitLocal_);
     if (large::sdf::length(delta) > volume_.voxelSize() * 0.35f && frameCounter_ >= nextSculptFrame_) {
+      const large::sdf::VoxelBounds previousStretchBounds = stretchUploadBounds_;
       volume_.applyStretchBrush(stretchSourceVolume_, stretchAnchorLocal_, delta, influenceRadius, 1.0f);
-      uploadSdfTexture();
+      const large::sdf::VoxelBounds currentStretchBounds = volume_.dirtyBounds();
+      uploadSdfTexture(previousStretchBounds);
+      stretchUploadBounds_ = currentStretchBounds;
       nextSculptFrame_ = frameCounter_ + 2;
       if (frameCounter_ >= nextSculptLogFrame_) {
         logInfo("Hand Stretch direct: delta=(%.2f %.2f %.2f), radius=%.2f",
@@ -2963,25 +2972,95 @@ class QuestSdfApp {
     return false;
   }
 
-  void uploadSdfTexture() {
+  static large::sdf::VoxelBounds mergeVoxelBounds(large::sdf::VoxelBounds a, large::sdf::VoxelBounds b) {
+    if (!b.valid) {
+      return a;
+    }
+    if (!a.valid) {
+      return b;
+    }
+
+    a.min.x = std::min(a.min.x, b.min.x);
+    a.min.y = std::min(a.min.y, b.min.y);
+    a.min.z = std::min(a.min.z, b.min.z);
+    a.max.x = std::max(a.max.x, b.max.x);
+    a.max.y = std::max(a.max.y, b.max.y);
+    a.max.z = std::max(a.max.z, b.max.z);
+    return a;
+  }
+
+  void uploadSdfTexture(large::sdf::VoxelBounds extraBounds = {}) {
     if (sdfTexture_ == 0) {
       return;
     }
 
     const large::sdf::IVec3 size = volume_.size();
+    large::sdf::VoxelBounds bounds = mergeVoxelBounds(volume_.dirtyBounds(), extraBounds);
+    if (!bounds.valid) {
+      return;
+    }
+
+    bounds.min.x = large::sdf::clampInt(bounds.min.x, 0, size.x - 1);
+    bounds.min.y = large::sdf::clampInt(bounds.min.y, 0, size.y - 1);
+    bounds.min.z = large::sdf::clampInt(bounds.min.z, 0, size.z - 1);
+    bounds.max.x = large::sdf::clampInt(bounds.max.x, bounds.min.x, size.x - 1);
+    bounds.max.y = large::sdf::clampInt(bounds.max.y, bounds.min.y, size.y - 1);
+    bounds.max.z = large::sdf::clampInt(bounds.max.z, bounds.min.z, size.z - 1);
+
+    const int width = bounds.max.x - bounds.min.x + 1;
+    const int height = bounds.max.y - bounds.min.y + 1;
+    const int depth = bounds.max.z - bounds.min.z + 1;
+    const int totalVoxels = size.x * size.y * size.z;
+    const int uploadVoxels = width * height * depth;
+    const bool uploadFull = uploadVoxels * 4 >= totalVoxels * 3;
+
     glBindTexture(GL_TEXTURE_3D, sdfTexture_);
-    glTexSubImage3D(GL_TEXTURE_3D,
-                    0,
-                    0,
-                    0,
-                    0,
-                    size.x,
-                    size.y,
-                    size.z,
-                    GL_RED,
-                    GL_FLOAT,
-                    volume_.values().data());
+    glPixelStorei(GL_UNPACK_ALIGNMENT, 1);
+    if (uploadFull) {
+      glTexSubImage3D(GL_TEXTURE_3D,
+                      0,
+                      0,
+                      0,
+                      0,
+                      size.x,
+                      size.y,
+                      size.z,
+                      GL_RED,
+                      GL_FLOAT,
+                      volume_.values().data());
+    } else {
+      uploadScratch_.resize(static_cast<std::size_t>(uploadVoxels));
+      const float* values = volume_.values().data();
+      float* packed = uploadScratch_.data();
+      for (int z = 0; z < depth; ++z) {
+        for (int y = 0; y < height; ++y) {
+          const std::size_t sourceIndex = volume_.index(bounds.min.x, bounds.min.y + y, bounds.min.z + z);
+          const std::size_t destinationIndex =
+              (static_cast<std::size_t>(z) * static_cast<std::size_t>(height) + static_cast<std::size_t>(y)) *
+              static_cast<std::size_t>(width);
+          std::copy_n(values + sourceIndex, width, packed + destinationIndex);
+        }
+      }
+
+      glTexSubImage3D(GL_TEXTURE_3D,
+                      0,
+                      bounds.min.x,
+                      bounds.min.y,
+                      bounds.min.z,
+                      width,
+                      height,
+                      depth,
+                      GL_RED,
+                      GL_FLOAT,
+                      packed);
+    }
+    const GLenum uploadError = glGetError();
     glBindTexture(GL_TEXTURE_3D, 0);
+    if (uploadError != GL_NO_ERROR) {
+      logError("SDF texture sub upload failed: 0x%x, box=%dx%dx%d", uploadError, width, height, depth);
+      return;
+    }
+    volume_.clearDirtyBounds();
   }
 
   bool initializeMeshRenderer() {
@@ -3858,6 +3937,7 @@ void main() {
       logError("SDF 3D texture upload failed: 0x%x", textureError);
       return false;
     }
+    volume_.clearDirtyBounds();
 
     glGenVertexArrays(1, &sdfVao_);
     glUseProgram(sdfProgram_);
@@ -4586,6 +4666,7 @@ void main() {
   GLuint sdfProgram_ = 0;
   GLuint sdfVao_ = 0;
   GLuint sdfTexture_ = 0;
+  std::vector<float> uploadScratch_;
   GLuint uiProgram_ = 0;
   GLuint uiVao_ = 0;
   GLint sdfCameraLocation_ = -1;
@@ -4729,6 +4810,7 @@ void main() {
   large::sdf::Vec3 stretchAnchorLocal_{};
   large::sdf::Vec3 stretchPullStartControllerLocal_{};
   XrQuaternionf stretchPullStartToolOrientationLocal_{0.0f, 0.0f, 0.0f, 1.0f};
+  large::sdf::VoxelBounds stretchUploadBounds_{};
   ControllerPose leftGripPose_{};
   ControllerPose rightGripPose_{};
   bool leftGripActive_ = false;

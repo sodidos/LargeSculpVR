@@ -21,6 +21,12 @@ struct IVec3 {
   int z = 0;
 };
 
+struct VoxelBounds {
+  bool valid = false;
+  IVec3 min{};
+  IVec3 max{};
+};
+
 class SdfVolume {
  public:
   SdfVolume(IVec3 size, float voxelSize, Vec3 origin, float initialDistance);
@@ -58,15 +64,22 @@ class SdfVolume {
   bool isSolid(int x, int y, int z) const;
   int countSolidVoxels() const;
   int countSurfaceVoxels() const;
+  VoxelBounds dirtyBounds() const { return dirtyBounds_; }
+  void clearDirtyBounds();
+  void markAllDirty();
 
   const std::vector<float>& values() const { return values_; }
   void restoreValues(std::vector<float> values);
 
  private:
+  void markDirtyVoxel(int x, int y, int z);
+  void markDirtyBounds(int minX, int minY, int minZ, int maxX, int maxY, int maxZ);
+
   IVec3 size_;
   float voxelSize_ = 1.0f;
   Vec3 origin_;
   std::vector<float> values_;
+  VoxelBounds dirtyBounds_{};
 };
 
 }  // namespace large::sdf

@@ -69,7 +69,11 @@ void SdfVolume::setValue(int x, int y, int z, float value) {
   if (!contains(x, y, z)) {
     return;
   }
-  values_[index(x, y, z)] = value;
+  const std::size_t i = index(x, y, z);
+  if (values_[i] != value) {
+    values_[i] = value;
+    markDirtyVoxel(x, y, z);
+  }
 }
 
 float SdfVolume::sample(Vec3 point) const {
@@ -173,6 +177,7 @@ void SdfVolume::applySphereBrush(Vec3 center, float radius, BrushMode mode, floa
       }
     }
   }
+  markDirtyBounds(minX, minY, minZ, maxX, maxY, maxZ);
 }
 
 void SdfVolume::applySmoothBrush(Vec3 center, float radius, float strength) {
@@ -181,6 +186,9 @@ void SdfVolume::applySmoothBrush(Vec3 center, float radius, float strength) {
   }
 
   const float amount = clamp(strength, 0.0f, 1.0f);
+  if (amount <= 0.0f) {
+    return;
+  }
   const auto source = values_;
 
   const int minX = clampInt(static_cast<int>(std::floor((center.x - radius - origin_.x) / voxelSize_)), 0, size_.x - 1);
@@ -213,6 +221,7 @@ void SdfVolume::applySmoothBrush(Vec3 center, float radius, float strength) {
       }
     }
   }
+  markDirtyBounds(minX, minY, minZ, maxX, maxY, maxZ);
 }
 
 void SdfVolume::applyStretchBrush(const SdfVolume& source, Vec3 anchor, Vec3 delta, float radius, float strength) {
@@ -283,6 +292,7 @@ void SdfVolume::applyStretchBrush(const SdfVolume& source,
       }
     }
   }
+  markDirtyBounds(minX, minY, minZ, maxX, maxY, maxZ);
 }
 
 SdfVolume SdfVolume::resampled(int resolution) const {
@@ -344,6 +354,50 @@ void SdfVolume::restoreValues(std::vector<float> values) {
     throw std::invalid_argument("SdfVolume snapshot size mismatch");
   }
   values_ = std::move(values);
+  markAllDirty();
+}
+
+void SdfVolume::clearDirtyBounds() {
+  dirtyBounds_ = {};
+}
+
+void SdfVolume::markAllDirty() {
+  markDirtyBounds(0, 0, 0, size_.x - 1, size_.y - 1, size_.z - 1);
+}
+
+void SdfVolume::markDirtyVoxel(int x, int y, int z) {
+  markDirtyBounds(x, y, z, x, y, z);
+}
+
+void SdfVolume::markDirtyBounds(int minX, int minY, int minZ, int maxX, int maxY, int maxZ) {
+  if (size_.x <= 0 || size_.y <= 0 || size_.z <= 0) {
+    return;
+  }
+
+  VoxelBounds next{};
+  next.valid = true;
+  next.min = {
+      clampInt(std::min(minX, maxX), 0, size_.x - 1),
+      clampInt(std::min(minY, maxY), 0, size_.y - 1),
+      clampInt(std::min(minZ, maxZ), 0, size_.z - 1),
+  };
+  next.max = {
+      clampInt(std::max(minX, maxX), 0, size_.x - 1),
+      clampInt(std::max(minY, maxY), 0, size_.y - 1),
+      clampInt(std::max(minZ, maxZ), 0, size_.z - 1),
+  };
+
+  if (!dirtyBounds_.valid) {
+    dirtyBounds_ = next;
+    return;
+  }
+
+  dirtyBounds_.min.x = std::min(dirtyBounds_.min.x, next.min.x);
+  dirtyBounds_.min.y = std::min(dirtyBounds_.min.y, next.min.y);
+  dirtyBounds_.min.z = std::min(dirtyBounds_.min.z, next.min.z);
+  dirtyBounds_.max.x = std::max(dirtyBounds_.max.x, next.max.x);
+  dirtyBounds_.max.y = std::max(dirtyBounds_.max.y, next.max.y);
+  dirtyBounds_.max.z = std::max(dirtyBounds_.max.z, next.max.z);
 }
 
 }  // namespace large::sdf

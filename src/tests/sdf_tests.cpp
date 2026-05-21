@@ -38,15 +38,22 @@ int main() {
 
   const int baseSolid = volume.countSolidVoxels();
   expect(baseSolid > 0, "sphere should create solid voxels");
+  volume.clearDirtyBounds();
 
   SdfHistory history(volume);
   history.capture();
   volume.applySphereBrush({0.32f, 0.0f, 0.0f}, 0.20f, BrushMode::Add);
+  const large::sdf::VoxelBounds addDirty = volume.dirtyBounds();
+  expect(addDirty.valid, "add brush should report dirty voxel bounds");
+  expect(addDirty.max.x - addDirty.min.x + 1 < size.x, "add brush dirty bounds should be partial");
   const int afterAdd = volume.countSolidVoxels();
   expect(afterAdd > baseSolid, "add brush should increase solid voxel count");
   expect(history.undo(), "undo should restore captured state");
+  expect(volume.dirtyBounds().valid, "undo should mark the restored volume dirty");
   expect(volume.countSolidVoxels() == baseSolid, "undo should restore base solid voxel count");
+  volume.clearDirtyBounds();
   expect(history.redo(), "redo should restore add brush state");
+  expect(volume.dirtyBounds().valid, "redo should mark the restored volume dirty");
   expect(volume.countSolidVoxels() == afterAdd, "redo should restore add brush solid voxel count");
 
   history.capture();
