@@ -2989,6 +2989,122 @@ class QuestSdfApp {
     return a;
   }
 
+  static large::sdf::VoxelBounds clampVoxelBounds(large::sdf::VoxelBounds bounds, large::sdf::IVec3 size) {
+    if (!bounds.valid || size.x <= 0 || size.y <= 0 || size.z <= 0) {
+      return {};
+    }
+
+    bounds.min.x = large::sdf::clampInt(bounds.min.x, 0, size.x - 1);
+    bounds.min.y = large::sdf::clampInt(bounds.min.y, 0, size.y - 1);
+    bounds.min.z = large::sdf::clampInt(bounds.min.z, 0, size.z - 1);
+    bounds.max.x = large::sdf::clampInt(bounds.max.x, bounds.min.x, size.x - 1);
+    bounds.max.y = large::sdf::clampInt(bounds.max.y, bounds.min.y, size.y - 1);
+    bounds.max.z = large::sdf::clampInt(bounds.max.z, bounds.min.z, size.z - 1);
+    return bounds;
+  }
+
+  static large::sdf::VoxelBounds paddedVoxelBounds(large::sdf::VoxelBounds bounds,
+                                                   large::sdf::IVec3 size,
+                                                   int paddingVoxels) {
+    if (!bounds.valid) {
+      return {};
+    }
+
+    bounds.min.x -= paddingVoxels;
+    bounds.min.y -= paddingVoxels;
+    bounds.min.z -= paddingVoxels;
+    bounds.max.x += paddingVoxels;
+    bounds.max.y += paddingVoxels;
+    bounds.max.z += paddingVoxels;
+    return clampVoxelBounds(bounds, size);
+  }
+
+  static bool isFullVoxelBounds(large::sdf::VoxelBounds bounds, large::sdf::IVec3 size) {
+    return bounds.valid && bounds.min.x <= 0 && bounds.min.y <= 0 && bounds.min.z <= 0 &&
+           bounds.max.x >= size.x - 1 && bounds.max.y >= size.y - 1 && bounds.max.z >= size.z - 1;
+  }
+
+  large::sdf::VoxelBounds computeSdfRenderBounds() const {
+    const large::sdf::IVec3 size = volume_.size();
+    const float surfaceBand = volume_.voxelSize() * 4.0f;
+    large::sdf::VoxelBounds bounds{};
+    const std::vector<float>& values = volume_.values();
+
+    for (int z = 0; z < size.z; ++z) {
+      for (int y = 0; y < size.y; ++y) {
+        for (int x = 0; x < size.x; ++x) {
+          if (values[volume_.index(x, y, z)] > surfaceBand) {
+            continue;
+          }
+
+          large::sdf::VoxelBounds voxel{};
+          voxel.valid = true;
+          voxel.min = {x, y, z};
+          voxel.max = {x, y, z};
+          bounds = mergeVoxelBounds(bounds, voxel);
+        }
+      }
+    }
+
+    if (!bounds.valid) {
+      bounds.valid = true;
+      bounds.min = {0, 0, 0};
+      bounds.max = {size.x - 1, size.y - 1, size.z - 1};
+    }
+    return paddedVoxelBounds(bounds, size, 5);
+  }
+
+  void recomputeSdfRenderBounds(const char* reason) {
+    renderBounds_ = computeSdfRenderBounds();
+    if (renderBounds_.valid) {
+      logInfo("SDF render bounds %s: [%d %d %d]-[%d %d %d]",
+              reason,
+              renderBounds_.min.x,
+              renderBounds_.min.y,
+              renderBounds_.min.z,
+              renderBounds_.max.x,
+              renderBounds_.max.y,
+              renderBounds_.max.z);
+    }
+  }
+
+  void expandSdfRenderBounds(large::sdf::VoxelBounds changedBounds) {
+    const large::sdf::IVec3 size = volume_.size();
+    changedBounds = paddedVoxelBounds(changedBounds, size, 5);
+    if (!changedBounds.valid) {
+      return;
+    }
+
+    if (!renderBounds_.valid) {
+      renderBounds_ = computeSdfRenderBounds();
+      return;
+    }
+
+    renderBounds_ = clampVoxelBounds(mergeVoxelBounds(renderBounds_, changedBounds), size);
+  }
+
+  large::sdf::Vec3 renderBoundsMin() const {
+    const large::sdf::IVec3 size = volume_.size();
+    const large::sdf::VoxelBounds bounds =
+        renderBounds_.valid ? clampVoxelBounds(renderBounds_, size) : computeSdfRenderBounds();
+    return {
+        volume_.origin().x + static_cast<float>(bounds.min.x) * volume_.voxelSize(),
+        volume_.origin().y + static_cast<float>(bounds.min.y) * volume_.voxelSize(),
+        volume_.origin().z + static_cast<float>(bounds.min.z) * volume_.voxelSize(),
+    };
+  }
+
+  large::sdf::Vec3 renderBoundsExtent() const {
+    const large::sdf::IVec3 size = volume_.size();
+    const large::sdf::VoxelBounds bounds =
+        renderBounds_.valid ? clampVoxelBounds(renderBounds_, size) : computeSdfRenderBounds();
+    return {
+        static_cast<float>(bounds.max.x - bounds.min.x + 1) * volume_.voxelSize(),
+        static_cast<float>(bounds.max.y - bounds.min.y + 1) * volume_.voxelSize(),
+        static_cast<float>(bounds.max.z - bounds.min.z + 1) * volume_.voxelSize(),
+    };
+  }
+
   void uploadSdfTexture(large::sdf::VoxelBounds extraBounds = {}) {
     if (sdfTexture_ == 0) {
       return;
@@ -3000,12 +3116,7 @@ class QuestSdfApp {
       return;
     }
 
-    bounds.min.x = large::sdf::clampInt(bounds.min.x, 0, size.x - 1);
-    bounds.min.y = large::sdf::clampInt(bounds.min.y, 0, size.y - 1);
-    bounds.min.z = large::sdf::clampInt(bounds.min.z, 0, size.z - 1);
-    bounds.max.x = large::sdf::clampInt(bounds.max.x, bounds.min.x, size.x - 1);
-    bounds.max.y = large::sdf::clampInt(bounds.max.y, bounds.min.y, size.y - 1);
-    bounds.max.z = large::sdf::clampInt(bounds.max.z, bounds.min.z, size.z - 1);
+    bounds = clampVoxelBounds(bounds, size);
 
     const int width = bounds.max.x - bounds.min.x + 1;
     const int height = bounds.max.y - bounds.min.y + 1;
@@ -3059,6 +3170,11 @@ class QuestSdfApp {
     if (uploadError != GL_NO_ERROR) {
       logError("SDF texture sub upload failed: 0x%x, box=%dx%dx%d", uploadError, width, height, depth);
       return;
+    }
+    if (isFullVoxelBounds(bounds, size)) {
+      recomputeSdfRenderBounds("recomputed");
+    } else {
+      expandSdfRenderBounds(bounds);
     }
     volume_.clearDirtyBounds();
   }
@@ -3218,6 +3334,8 @@ uniform mat3 uViewRotation;
 uniform vec4 uFovTangents;
 uniform vec3 uVolumeMin;
 uniform vec3 uVolumeExtent;
+uniform vec3 uRenderMin;
+uniform vec3 uRenderExtent;
 uniform vec3 uObjectPos;
 uniform mat3 uObjectRotation;
 uniform mat3 uObjectInvRotation;
@@ -3596,15 +3714,15 @@ vec3 shadeUv(vec2 uv, out float sceneDepth, out float sceneAlpha) {
   vec3 rayDir = normalize(uViewRotation * normalize(vec3(x, y, -1.0)));
   vec3 rayOrigin = uCameraPos;
   float roomDepth = 10000.0;
-  vec3 background = shadeRoom(rayOrigin, rayDir, roomDepth);
   vec3 rayOriginLocal = worldToLocal(rayOrigin);
   vec3 rayDirLocal = normalize(uObjectInvRotation * rayDir);
 
-  vec3 boxMin = uVolumeMin;
-  vec3 boxMax = uVolumeMin + uVolumeExtent;
-  vec2 hit = intersectBox(rayOriginLocal, rayDirLocal, boxMin, boxMax);
+  vec3 renderBoxMin = uRenderMin;
+  vec3 renderBoxMax = uRenderMin + uRenderExtent;
+  vec2 hit = intersectBox(rayOriginLocal, rayDirLocal, renderBoxMin, renderBoxMax);
 
   if (hit.y <= max(hit.x, 0.0)) {
+    vec3 background = shadeRoom(rayOrigin, rayDir, roomDepth);
     sceneDepth = roomDepth;
     return background;
   }
@@ -3660,6 +3778,7 @@ vec3 shadeUv(vec2 uv, out float sceneDepth, out float sceneAlpha) {
   }
 
   if (!found) {
+    vec3 background = shadeRoom(rayOrigin, rayDir, roomDepth);
     sceneDepth = roomDepth;
     return background;
   }
@@ -3879,6 +3998,8 @@ void main() {
     sdfFovTangentsLocation_ = glGetUniformLocation(sdfProgram_, "uFovTangents");
     sdfVolumeMinLocation_ = glGetUniformLocation(sdfProgram_, "uVolumeMin");
     sdfVolumeExtentLocation_ = glGetUniformLocation(sdfProgram_, "uVolumeExtent");
+    sdfRenderMinLocation_ = glGetUniformLocation(sdfProgram_, "uRenderMin");
+    sdfRenderExtentLocation_ = glGetUniformLocation(sdfProgram_, "uRenderExtent");
     sdfObjectPosLocation_ = glGetUniformLocation(sdfProgram_, "uObjectPos");
     sdfObjectRotationLocation_ = glGetUniformLocation(sdfProgram_, "uObjectRotation");
     sdfObjectInvRotationLocation_ = glGetUniformLocation(sdfProgram_, "uObjectInvRotation");
@@ -3903,6 +4024,7 @@ void main() {
     const GLint samplerLocation = glGetUniformLocation(sdfProgram_, "uSdf");
     if (sdfCameraLocation_ < 0 || sdfViewRotationLocation_ < 0 || sdfFovTangentsLocation_ < 0 ||
         sdfVolumeMinLocation_ < 0 || sdfVolumeExtentLocation_ < 0 || sdfObjectPosLocation_ < 0 ||
+        sdfRenderMinLocation_ < 0 || sdfRenderExtentLocation_ < 0 ||
         sdfObjectRotationLocation_ < 0 || sdfObjectInvRotationLocation_ < 0 || sdfObjectScaleLocation_ < 0 ||
         sdfBrushCenterLocation_ < 0 || sdfBrushRadiusLocation_ < 0 || sdfBrushVisibleLocation_ < 0 ||
         sdfTriggerValueLocation_ < 0 || sdfToolIndexLocation_ < 0 || sdfArEnabledLocation_ < 0 ||
@@ -3938,6 +4060,7 @@ void main() {
       return false;
     }
     volume_.clearDirtyBounds();
+    recomputeSdfRenderBounds("initial");
 
     glGenVertexArrays(1, &sdfVao_);
     glUseProgram(sdfProgram_);
@@ -3980,6 +4103,10 @@ void main() {
                 std::tan(views_[eye].fov.angleUp));
     glUniform3f(sdfVolumeMinLocation_, origin.x, origin.y, origin.z);
     glUniform3f(sdfVolumeExtentLocation_, extent.x, extent.y, extent.z);
+    const large::sdf::Vec3 activeMin = renderBoundsMin();
+    const large::sdf::Vec3 activeExtent = renderBoundsExtent();
+    glUniform3f(sdfRenderMinLocation_, activeMin.x, activeMin.y, activeMin.z);
+    glUniform3f(sdfRenderExtentLocation_, activeExtent.x, activeExtent.y, activeExtent.z);
     glUniform3f(sdfObjectPosLocation_, objectPosition_.x, objectPosition_.y, objectPosition_.z);
     const std::array<float, 9> objectRotationMatrix = makeRotationMatrix3(objectRotation_);
     const std::array<float, 9> objectInvRotationMatrix = transposeMatrix3(objectRotationMatrix);
@@ -4667,6 +4794,7 @@ void main() {
   GLuint sdfVao_ = 0;
   GLuint sdfTexture_ = 0;
   std::vector<float> uploadScratch_;
+  large::sdf::VoxelBounds renderBounds_{};
   GLuint uiProgram_ = 0;
   GLuint uiVao_ = 0;
   GLint sdfCameraLocation_ = -1;
@@ -4674,6 +4802,8 @@ void main() {
   GLint sdfFovTangentsLocation_ = -1;
   GLint sdfVolumeMinLocation_ = -1;
   GLint sdfVolumeExtentLocation_ = -1;
+  GLint sdfRenderMinLocation_ = -1;
+  GLint sdfRenderExtentLocation_ = -1;
   GLint sdfObjectPosLocation_ = -1;
   GLint sdfObjectRotationLocation_ = -1;
   GLint sdfObjectInvRotationLocation_ = -1;
