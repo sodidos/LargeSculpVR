@@ -3,7 +3,7 @@ build/
 build-*/
 out/
 
-# CMake / Visual Studio
+# CMake generated files
 .vs/
 CMakeFiles/
 CMakeCache.txt

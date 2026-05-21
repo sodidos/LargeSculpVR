@@ -1,7 +1,7 @@
 # Interface VR v0
 
-Objectif : retrouver la logique de la preview GPU, mais avec les deux manettes
-comme outils naturels de sculpture.
+Objectif : definir une interface de sculpture native Quest 3 avec les deux
+manettes et le suivi des mains comme controles principaux.
 
 ## Principes
 
@@ -89,7 +89,7 @@ comme outils naturels de sculpture.
 
 1. Demarrer une activite Quest native et valider OpenXR sur le casque.
 2. Creer session OpenXR + swapchains stereo.
-3. Porter le raymarching SDF de D3D11 vers OpenGL ES 3.2 ou Vulkan.
+3. Stabiliser le raymarching SDF OpenGL ES 3.2 sur Quest 3.
 4. Ajouter les actions OpenXR des manettes Touch.
 5. Brancher add/sub/smooth.
 6. Brancher stretch avec ancre, delta et rayon d'influence.

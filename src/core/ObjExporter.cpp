@@ -120,7 +120,7 @@ ObjExportStats exportSolidVoxelsAsObj(const SdfVolume& volume, const std::filesy
   const float s = volume.voxelSize();
   const Vec3 origin = volume.origin();
 
-  out << "# Large SDF blocky preview mesh\n";
+  out << "# LargeSculpVR blocky mesh\n";
 
   for (int z = 0; z < size.z; ++z) {
     for (int y = 0; y < size.y; ++y) {
@@ -176,7 +176,7 @@ ObjExportStats exportSdfSurfaceAsObj(const SdfVolume& volume, const std::filesys
   ObjExportStats stats;
   const IVec3 size = volume.size();
 
-  out << "# Large SDF triangulated surface preview mesh\n";
+  out << "# LargeSculpVR triangulated surface mesh\n";
 
   constexpr std::array<std::array<int, 4>, 6> tetrahedra = {{
       {{0, 5, 1, 6}},

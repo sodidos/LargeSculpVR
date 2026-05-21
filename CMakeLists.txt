@@ -26,17 +26,3 @@ add_executable(large_sdf_tests
 )
 
 target_link_libraries(large_sdf_tests PRIVATE large_sdf_core)
-
-if(WIN32)
-  add_executable(large_sdf_preview WIN32
-    src/desktop/Win32SdfPreview.cpp
-  )
-
-  target_link_libraries(large_sdf_preview PRIVATE large_sdf_core user32 gdi32)
-
-  add_executable(large_sdf_gpu_preview WIN32
-    src/desktop/D3D11SdfPreview.cpp
-  )
-
-  target_link_libraries(large_sdf_gpu_preview PRIVATE large_sdf_core user32 d3d11 dxgi d3dcompiler)
-endif()

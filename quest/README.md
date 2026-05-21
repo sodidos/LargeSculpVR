@@ -42,7 +42,7 @@ Installer :
 1. Android Studio.
 2. Dans le SDK Manager : Android SDK Platform 32, Android SDK Platform-Tools,
    Android SDK Build-Tools, NDK (Side by side) et CMake.
-3. Les pilotes Oculus ADB si Windows ne detecte pas le Quest.
+3. Les pilotes ADB Oculus/Meta si le Quest n'est pas detecte par `adb`.
 
 Le premier build n'a pas besoin d'un SDK OpenXR local : Gradle recupere
 `org.khronos.openxr:openxr_loader_for_android:1.1.53`. Le SDK Meta OpenXR reste
@@ -65,7 +65,7 @@ Depuis ce dossier :
 .\check_quest_env.ps1
 ```
 
-Si Windows bloque l'execution des scripts PowerShell :
+Si PowerShell bloque l'execution des scripts :
 
 ```powershell
 powershell -NoProfile -ExecutionPolicy Bypass -File .\check_quest_env.ps1
