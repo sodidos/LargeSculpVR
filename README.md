@@ -8,13 +8,17 @@ suivi des mains.
 
 ## Objectif
 
-- sculpture volumique SDF en temps reel ;
+- sculpture volumique SDF en temps reel, scene vierge au demarrage ;
 - rendu stereo OpenGL ES par raymarching d'une texture 3D ;
-- outils Add, Subtract, Smooth et Stretch ;
+- outils Add, Subtract, Smooth, Stretch, Flatten (aplatir), Groove (rainure),
+  Crease (pincement d'arete) et Paint (peinture volumique avec palette) ;
+- traits continus : les coups de pinceau rapides sont relies par des capsules ;
 - manipulation de l'objet avec les grips ;
-- HUD/menu spatial devant la manette gauche ;
-- support experimental du suivi des mains Quest ;
-- export OBJ de la sculpture.
+- HUD/menu spatial devant la manette gauche, avec vrai texte rendu CPU
+  (police bitmap) dans une texture echantillonnee par le shader UI ;
+- suivi des mains Quest avec hysteresis et lissage des gestes ;
+- undo/redo couvrant la sculpture et la peinture ;
+- export OBJ avec couleurs de sommets, sauvegarde locale v2 (SDF + couleurs).
 
 ## Structure
 
@@ -41,17 +45,42 @@ autorise.
 
 ## Interaction Actuelle
 
-- gachette droite : appliquer l'outil actif ;
-- A/B : outil suivant / precedent ;
+- gachette droite : appliquer l'outil actif (Add fonctionne en espace vide,
+  ce qui permet de creer la premiere matiere dans la scene vierge) ;
+- A/B : outil suivant / precedent (Add, Subtract, Smooth, Stretch, Flatten,
+  Groove, Crease, Paint) ;
 - joystick gauche horizontal : intensite de l'outil actif ;
 - joystick gauche vertical : taille de l'outil actif ;
-- X/Y : undo / redo ;
-- bouton menu gauche : menu tools / save / load / export / quit ;
+- X/Y : undo / redo (sculpture et peinture) ;
+- bouton menu gauche : menu en deux colonnes (outils a gauche, actions SAVE /
+  LOAD / EXPORT / QUIT / AR / MIRROR a droite) + palette de 8 couleurs de
+  peinture (grille 4x2 de grandes cases) ;
+- MIRROR : mode symetrie, chaque coup de pinceau est duplique en miroir sur
+  le plan local X=0 (Stretch compris), visualise par un disque bleu
+  transparent ;
+- LOCK : fige la position, la rotation et l'echelle de l'objet (les grips et
+  le pincement-zoom sont ignores tant que le verrou est actif) ;
+- joystick droit : deplacement dans le decor (avant/arriere et lateral,
+  relatif au regard) ; en mode AR seul l'objet semble se deplacer ;
+- EXPORT publie l'OBJ dans `Documents/LargeSculpVR/sculpt_<date>.obj`,
+  visible dans le gestionnaire de fichiers du Quest et par USB ;
+- AR : passthrough compose sous la scene, le fond devient transparent et la
+  sculpture reste opaque ;
 - grip gauche ou droit : deplacer et tourner la sculpture ;
 - deux grips : zoomer et tourner autour de l'axe entre les mains ;
 - Stretch : poser une ancre avec la gachette droite, puis tirer la zone ;
+- Flatten : un disque transparent previsualise le plan tangent sous le pinceau
+  avant d'appuyer ; le plan est verrouille au premier contact du trait, les
+  bosses sont rasees et les creux combles vers ce plan ;
+- Groove : creuse une rainure fine (capsule) le long du mouvement ;
+- Crease : pince la matiere vers le centre du pinceau pour affuter les aretes ;
+- Paint : depose la couleur choisie dans la palette pres de la surface ;
 - suivi des mains : poing gauche pour grab, pincement gauche pour zoom,
-  pincement droit pour sculpter, clap des deux mains pour changer d'outil.
+  pincement droit pour sculpter/peindre, clap des deux mains pour changer
+  d'outil ; les gestes ont une hysteresis et les positions sont lissees ;
+- menu aux mains : bouton MENU dans l'en-tete du panneau du poignet gauche,
+  et appui direct de l'index droit sur le panneau pour survoler et cliquer
+  (la sculpture est suspendue quand le doigt est dans la zone du panneau).
 
 La scene VR inclut une piece vide fixe en arriere-plan pour donner un repere
 stable pendant la manipulation de l'objet.

@@ -160,20 +160,171 @@ void SdfVolume::applySphereBrush(Vec3 center, float radius, BrushMode mode, floa
   const int maxY = clampInt(static_cast<int>(std::ceil((center.y + influence - origin_.y) / voxelSize_)), 0, size_.y - 1);
   const int maxZ = clampInt(static_cast<int>(std::ceil((center.z + influence - origin_.z) / voxelSize_)), 0, size_.z - 1);
 
+  // At full strength the brush is an exact CSG union/difference: the field
+  // stays a true distance field, which keeps the surface and its normals
+  // smooth. Partial strengths blend within a narrow band (soft feel, slightly
+  // less exact field).
+  const bool exact = amount >= 0.999f;
+
   for (int z = minZ; z <= maxZ; ++z) {
     for (int y = minY; y <= maxY; ++y) {
       for (int x = minX; x <= maxX; ++x) {
         const float dist = length(voxelCenter(x, y, z) - center);
         const float brush = dist - radius;
-        const float falloff = 1.0f - smoothstep(0.0f, 1.0f, dist / influence);
         const std::size_t i = index(x, y, z);
-        if (mode == BrushMode::Add) {
-          const float target = std::min(values_[i], brush);
-          values_[i] = values_[i] + (target - values_[i]) * amount * falloff;
-        } else if (mode == BrushMode::Subtract) {
-          const float target = std::max(values_[i], -brush);
-          values_[i] = values_[i] + (target - values_[i]) * amount * falloff;
+        if (exact) {
+          values_[i] = mode == BrushMode::Add ? std::min(values_[i], brush) : std::max(values_[i], -brush);
+          continue;
         }
+
+        const float falloff = 1.0f - smoothstep(0.0f, 1.0f, dist / influence);
+        // Clamp the source into a narrow band so partial-falloff blends still
+        // cross zero in untouched far-field regions (initial distance is large).
+        const float base = clamp(values_[i], -influence, influence);
+        if (mode == BrushMode::Add) {
+          const float target = std::min(base, brush);
+          values_[i] = base + (target - base) * amount * falloff;
+        } else if (mode == BrushMode::Subtract) {
+          const float target = std::max(base, -brush);
+          values_[i] = base + (target - base) * amount * falloff;
+        }
+      }
+    }
+  }
+  markDirtyBounds(minX, minY, minZ, maxX, maxY, maxZ);
+}
+
+void SdfVolume::applyCapsuleBrush(Vec3 start, Vec3 end, float radius, BrushMode mode, float strength) {
+  if (radius <= 0.0f) {
+    return;
+  }
+
+  const float amount = clamp(strength, 0.0f, 1.0f);
+  if (amount <= 0.0f) {
+    return;
+  }
+
+  const Vec3 segment = end - start;
+  const float segmentLengthSq = dot(segment, segment);
+  const float influence = radius + voxelSize_ * 3.0f;
+  const Vec3 minPoint{
+      std::min(start.x, end.x) - influence,
+      std::min(start.y, end.y) - influence,
+      std::min(start.z, end.z) - influence,
+  };
+  const Vec3 maxPoint{
+      std::max(start.x, end.x) + influence,
+      std::max(start.y, end.y) + influence,
+      std::max(start.z, end.z) + influence,
+  };
+
+  const int minX = clampInt(static_cast<int>(std::floor((minPoint.x - origin_.x) / voxelSize_)), 0, size_.x - 1);
+  const int minY = clampInt(static_cast<int>(std::floor((minPoint.y - origin_.y) / voxelSize_)), 0, size_.y - 1);
+  const int minZ = clampInt(static_cast<int>(std::floor((minPoint.z - origin_.z) / voxelSize_)), 0, size_.z - 1);
+  const int maxX = clampInt(static_cast<int>(std::ceil((maxPoint.x - origin_.x) / voxelSize_)), 0, size_.x - 1);
+  const int maxY = clampInt(static_cast<int>(std::ceil((maxPoint.y - origin_.y) / voxelSize_)), 0, size_.y - 1);
+  const int maxZ = clampInt(static_cast<int>(std::ceil((maxPoint.z - origin_.z) / voxelSize_)), 0, size_.z - 1);
+
+  const bool exact = amount >= 0.999f;
+
+  for (int z = minZ; z <= maxZ; ++z) {
+    for (int y = minY; y <= maxY; ++y) {
+      for (int x = minX; x <= maxX; ++x) {
+        const Vec3 p = voxelCenter(x, y, z);
+        const Vec3 toPoint = p - start;
+        const float h =
+            segmentLengthSq > 0.000001f ? clamp(dot(toPoint, segment) / segmentLengthSq, 0.0f, 1.0f) : 0.0f;
+        const float dist = length(toPoint - segment * h);
+        const float brush = dist - radius;
+        const std::size_t i = index(x, y, z);
+        if (exact) {
+          values_[i] = mode == BrushMode::Add ? std::min(values_[i], brush) : std::max(values_[i], -brush);
+          continue;
+        }
+
+        const float falloff = 1.0f - smoothstep(0.0f, 1.0f, dist / influence);
+        const float base = clamp(values_[i], -influence, influence);
+        if (mode == BrushMode::Add) {
+          const float target = std::min(base, brush);
+          values_[i] = base + (target - base) * amount * falloff;
+        } else if (mode == BrushMode::Subtract) {
+          const float target = std::max(base, -brush);
+          values_[i] = base + (target - base) * amount * falloff;
+        }
+      }
+    }
+  }
+  markDirtyBounds(minX, minY, minZ, maxX, maxY, maxZ);
+}
+
+void SdfVolume::applyFlattenBrush(Vec3 center, Vec3 planePoint, Vec3 planeNormal, float radius, float strength) {
+  if (radius <= 0.0f || strength <= 0.0f) {
+    return;
+  }
+
+  const Vec3 n = normalize(planeNormal);
+  const float amount = clamp(strength, 0.0f, 1.0f);
+
+  const int minX = clampInt(static_cast<int>(std::floor((center.x - radius - origin_.x) / voxelSize_)), 0, size_.x - 1);
+  const int minY = clampInt(static_cast<int>(std::floor((center.y - radius - origin_.y) / voxelSize_)), 0, size_.y - 1);
+  const int minZ = clampInt(static_cast<int>(std::floor((center.z - radius - origin_.z) / voxelSize_)), 0, size_.z - 1);
+  const int maxX = clampInt(static_cast<int>(std::ceil((center.x + radius - origin_.x) / voxelSize_)), 0, size_.x - 1);
+  const int maxY = clampInt(static_cast<int>(std::ceil((center.y + radius - origin_.y) / voxelSize_)), 0, size_.y - 1);
+  const int maxZ = clampInt(static_cast<int>(std::ceil((center.z + radius - origin_.z) / voxelSize_)), 0, size_.z - 1);
+
+  for (int z = minZ; z <= maxZ; ++z) {
+    for (int y = minY; y <= maxY; ++y) {
+      for (int x = minX; x <= maxX; ++x) {
+        const Vec3 p = voxelCenter(x, y, z);
+        const float dist = length(p - center);
+        if (dist > radius) {
+          continue;
+        }
+
+        // Blend the local field toward the locked plane: bumps above the
+        // plane are shaved off and dips below it are filled in.
+        const float planeDistance = dot(p - planePoint, n);
+        const float falloff = 1.0f - smoothstep(0.0f, 1.0f, dist / radius);
+        const std::size_t i = index(x, y, z);
+        const float base = clamp(values_[i], -radius, radius);
+        values_[i] = base + (planeDistance - base) * amount * falloff;
+      }
+    }
+  }
+  markDirtyBounds(minX, minY, minZ, maxX, maxY, maxZ);
+}
+
+void SdfVolume::applyPinchBrush(Vec3 center, float radius, float strength) {
+  if (radius <= 0.0f || strength <= 0.0f) {
+    return;
+  }
+
+  const float amount = clamp(strength, 0.0f, 1.0f);
+  // Resample the field from positions pushed away from the brush center, so
+  // the local geometry contracts toward it: edges under the stroke sharpen
+  // into a crease (Medium-style pinch).
+  const SdfVolume source = *this;
+
+  const int minX = clampInt(static_cast<int>(std::floor((center.x - radius - origin_.x) / voxelSize_)), 0, size_.x - 1);
+  const int minY = clampInt(static_cast<int>(std::floor((center.y - radius - origin_.y) / voxelSize_)), 0, size_.y - 1);
+  const int minZ = clampInt(static_cast<int>(std::floor((center.z - radius - origin_.z) / voxelSize_)), 0, size_.z - 1);
+  const int maxX = clampInt(static_cast<int>(std::ceil((center.x + radius - origin_.x) / voxelSize_)), 0, size_.x - 1);
+  const int maxY = clampInt(static_cast<int>(std::ceil((center.y + radius - origin_.y) / voxelSize_)), 0, size_.y - 1);
+  const int maxZ = clampInt(static_cast<int>(std::ceil((center.z + radius - origin_.z) / voxelSize_)), 0, size_.z - 1);
+
+  for (int z = minZ; z <= maxZ; ++z) {
+    for (int y = minY; y <= maxY; ++y) {
+      for (int x = minX; x <= maxX; ++x) {
+        const Vec3 p = voxelCenter(x, y, z);
+        const float dist = length(p - center);
+        if (dist > radius) {
+          continue;
+        }
+
+        const float falloff = 1.0f - smoothstep(0.0f, 1.0f, dist / radius);
+        const float scale = 1.0f + amount * 0.45f * falloff;
+        const Vec3 samplePoint = center + (p - center) * scale;
+        setValue(x, y, z, source.sample(samplePoint));
       }
     }
   }
@@ -206,15 +357,19 @@ void SdfVolume::applySmoothBrush(Vec3 center, float radius, float strength) {
           continue;
         }
 
+        // Average within a narrow band: untouched far-field values (large
+        // magnitudes) would otherwise drag the average and carve the surface
+        // instead of smoothing it near the borders of the sculpted region.
+        const float band = voxelSize_ * 4.0f;
         const std::size_t i = index(x, y, z);
-        const float original = source[i];
+        const float original = clamp(source[i], -band, band);
         const float average =
-            (sourceValue(source, size_, original, x - 1, y, z) +
-             sourceValue(source, size_, original, x + 1, y, z) +
-             sourceValue(source, size_, original, x, y - 1, z) +
-             sourceValue(source, size_, original, x, y + 1, z) +
-             sourceValue(source, size_, original, x, y, z - 1) +
-             sourceValue(source, size_, original, x, y, z + 1)) /
+            (clamp(sourceValue(source, size_, original, x - 1, y, z), -band, band) +
+             clamp(sourceValue(source, size_, original, x + 1, y, z), -band, band) +
+             clamp(sourceValue(source, size_, original, x, y - 1, z), -band, band) +
+             clamp(sourceValue(source, size_, original, x, y + 1, z), -band, band) +
+             clamp(sourceValue(source, size_, original, x, y, z - 1), -band, band) +
+             clamp(sourceValue(source, size_, original, x, y, z + 1), -band, band)) /
             6.0f;
         const float falloff = 1.0f - smoothstep(0.0f, 1.0f, dist / radius);
         values_[i] = original + (average - original) * amount * falloff;
@@ -224,7 +379,12 @@ void SdfVolume::applySmoothBrush(Vec3 center, float radius, float strength) {
   markDirtyBounds(minX, minY, minZ, maxX, maxY, maxZ);
 }
 
-void SdfVolume::applyStretchBrush(const SdfVolume& source, Vec3 anchor, Vec3 delta, float radius, float strength) {
+void SdfVolume::applyStretchBrush(const SdfVolume& source,
+                                  Vec3 anchor,
+                                  Vec3 delta,
+                                  float radius,
+                                  float strength,
+                                  bool resetToSource) {
   applyStretchBrush(source,
                     anchor,
                     delta,
@@ -232,7 +392,8 @@ void SdfVolume::applyStretchBrush(const SdfVolume& source, Vec3 anchor, Vec3 del
                     {0.0f, 1.0f, 0.0f},
                     {0.0f, 0.0f, 1.0f},
                     radius,
-                    strength);
+                    strength,
+                    resetToSource);
 }
 
 void SdfVolume::applyStretchBrush(const SdfVolume& source,
@@ -242,7 +403,8 @@ void SdfVolume::applyStretchBrush(const SdfVolume& source,
                                   Vec3 rotationY,
                                   Vec3 rotationZ,
                                   float radius,
-                                  float strength) {
+                                  float strength,
+                                  bool resetToSource) {
   if (radius <= 0.0f || strength <= 0.0f) {
     return;
   }
@@ -251,7 +413,9 @@ void SdfVolume::applyStretchBrush(const SdfVolume& source,
     throw std::invalid_argument("SdfVolume stretch source must match destination volume");
   }
 
-  values_ = source.values_;
+  if (resetToSource) {
+    values_ = source.values_;
+  }
 
   const float amount = clamp(strength, 0.0f, 1.0f);
   const Vec3 pull = delta * amount;
@@ -274,21 +438,71 @@ void SdfVolume::applyStretchBrush(const SdfVolume& source,
   const int maxY = clampInt(static_cast<int>(std::ceil((maxPoint.y - origin_.y) / voxelSize_)), 0, size_.y - 1);
   const int maxZ = clampInt(static_cast<int>(std::ceil((maxPoint.z - origin_.z) / voxelSize_)), 0, size_.z - 1);
 
+  // Influence follows the whole pull path (capsule from anchor to handle),
+  // with an axial ramp: material near the anchor stays attached while the
+  // far end follows the hand completely. A sphere around the handle alone
+  // would detach the pulled lobe as soon as the pull exceeds the radius.
+  const Vec3 segment = handle - anchor;
+  const float segmentLengthSq = dot(segment, segment);
+  const bool degenerate = segmentLengthSq < voxelSize_ * voxelSize_ * 0.01f;
+
+  const auto warpWeight = [&](Vec3 p) {
+    float axial = 1.0f;
+    float distToPath;
+    if (degenerate) {
+      distToPath = length(p - handle);
+    } else {
+      const float h = clamp(dot(p - anchor, segment) / segmentLengthSq, 0.0f, 1.0f);
+      distToPath = length(p - (anchor + segment * h));
+      axial = h;
+    }
+    if (distToPath > radius) {
+      return 0.0f;
+    }
+    const float radial = 1.0f - smoothstep(0.0f, 1.0f, distToPath / radius);
+    return radial * axial;
+  };
+
   for (int z = minZ; z <= maxZ; ++z) {
     for (int y = minY; y <= maxY; ++y) {
       for (int x = minX; x <= maxX; ++x) {
         const Vec3 p = voxelCenter(x, y, z);
-        const float dist = length(p - handle);
-        if (dist > radius) {
+        const float weight = warpWeight(p);
+        if (weight <= 0.0f) {
           continue;
         }
 
-        const float falloff = 1.0f - smoothstep(0.0f, 1.0f, dist / radius);
-        const Vec3 translated = p - pull * falloff;
+        const Vec3 translated = p - pull * weight;
         const Vec3 relative = translated - anchor;
         const Vec3 rotatedBack = inverseRotate(relative, rotationX, rotationY, rotationZ);
-        const Vec3 sourcePoint = anchor + relative + (rotatedBack - relative) * falloff;
+        const Vec3 sourcePoint = anchor + relative + (rotatedBack - relative) * weight;
         setValue(x, y, z, source.sample(sourcePoint));
+      }
+    }
+  }
+
+  // The warp does not preserve distances (the field gets compressed on one
+  // side and dilated on the other), which shows up as torn or crumpled
+  // surfaces. One relaxation pass, weighted by the local warp amount,
+  // re-regularizes the field. The volume is rebuilt from the source on every
+  // application, so this never accumulates over a stroke.
+  const float band = voxelSize_ * 4.0f;
+  for (int z = minZ; z <= maxZ; ++z) {
+    for (int y = minY; y <= maxY; ++y) {
+      for (int x = minX; x <= maxX; ++x) {
+        const float weight = warpWeight(voxelCenter(x, y, z));
+        if (weight <= 0.0f) {
+          continue;
+        }
+
+        const std::size_t i = index(x, y, z);
+        const float original = clamp(values_[i], -band, band);
+        const float average =
+            (clamp(value(x - 1, y, z), -band, band) + clamp(value(x + 1, y, z), -band, band) +
+             clamp(value(x, y - 1, z), -band, band) + clamp(value(x, y + 1, z), -band, band) +
+             clamp(value(x, y, z - 1), -band, band) + clamp(value(x, y, z + 1), -band, band)) /
+            6.0f;
+        values_[i] = original + (average - original) * 0.5f * weight;
       }
     }
   }

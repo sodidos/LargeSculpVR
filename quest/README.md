@@ -114,9 +114,19 @@ Interaction actuelle :
 
 - main droite : viser la surface SDF ;
 - zone coloree : position du pinceau, avec une couleur par outil ;
-- gachette droite : appliquer l'outil actif ;
+- gachette droite : appliquer l'outil actif ; Add fonctionne aussi en espace
+  vide pour creer la premiere matiere (la scene demarre vierge) ;
 - A/B : outil suivant / precedent ;
-- outils actuels : Add, Subtract, Smooth, Stretch ;
+- outils actuels : Add, Subtract, Smooth, Stretch, Flatten, Groove, Crease,
+  Paint ;
+- Flatten : plan verrouille au debut du trait, rase les bosses et comble les
+  creux (hard surface) ;
+- Groove : rainure fine creusee le long du mouvement ;
+- Crease : pince la matiere vers le pinceau pour affuter les aretes ;
+- Paint : couleur volumique pres de la surface, palette de 8 couleurs dans le
+  menu (choisir une couleur active l'outil Paint) ; undo/redo couvre aussi la
+  peinture ; EXPORT ecrit les couleurs de sommets dans l'OBJ ;
+- les coups de pinceau rapides sont relies par des capsules (traits continus) ;
 - Stretch : en mode Stretch, la gachette droite pose la zone attrapee, puis le
   mouvement de la manette droite deplace/etire cette zone jusqu'au relachement ;
   relacher la gachette libere l'accroche, le prochain appui choisit une
@@ -124,11 +134,14 @@ Interaction actuelle :
 - joystick gauche : gauche/droite regle l'intensite, haut/bas regle la taille
   du pinceau de l'outil actif ; chaque outil conserve ses propres reglages ;
 - X/Y : undo / redo ;
-- bouton menu gauche : affiche le panneau minimal outils + SAVE / LOAD /
-  EXPORT / QUIT devant la manette gauche ;
-- HUD spatial devant la manette gauche : nom du pinceau actif, taille verticale
-  et puissance ; le rendu actuel a ete remis dans une passe separee du shader
-  SDF afin de ne plus perturber l'objet ;
+- bouton menu gauche : affiche le panneau outils + SAVE / LOAD / EXPORT /
+  QUIT / AR + palette de couleurs devant la manette gauche ;
+- HUD spatial devant la manette gauche : nom de l'outil, barres SIZE et POWER
+  avec valeurs numeriques, rappels des raccourcis ; le panneau est peint cote
+  CPU (police bitmap 5x7 dans `HudPainter.h`) dans une texture 2D mise a jour
+  seulement quand l'etat change, puis echantillonnee par la passe UI ; le
+  layout pixel est partage entre le dessin et le hit-test du rayon, donc ce
+  qui est affiche correspond exactement a ce qui est cliquable ;
 - representation de l'outil pres de la manette droite : manche court + tete
   coloree selon l'outil actif, rendue separement de la surface SDF ;
 - quand le menu est ouvert, le rayon/gachette droite reste l'interaction de
@@ -147,9 +160,12 @@ Interaction actuelle :
 - pincement main droite pres de la surface : applique l'outil actif a la
   position pincee ; Stretch tire directement la zone pincee ;
 - les mains suivies sont visualisees dans la passe UI separee sous forme de
-  squelette/capsules sans glow ; la main droite prend la couleur de l'outil
-  actif ;
-- la texture SDF 3D est re-uploadee au GPU apres chaque coup de pinceau.
+  capsules gris pale translucides (style mains systeme) ; seul le bout de
+  l'index droit porte une pastille discrete de la couleur de l'outil actif ;
+- la texture SDF 3D est re-uploadee au GPU apres chaque coup de pinceau ;
+- la matiere qui atteint les limites du volume de travail est fermee par une
+  face plate (champ intersecte avec la boite), a l'affichage comme a l'export
+  OBJ.
 
 ## Mapping VR prevu
 

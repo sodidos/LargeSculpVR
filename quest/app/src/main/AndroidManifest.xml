@@ -19,6 +19,12 @@
         android:name="com.oculus.feature.PASSTHROUGH"
         android:required="false" />
 
+    <!-- Marks the app as mixed-reality capable: without it some Horizon OS
+         versions refuse the passthrough video feed (black background). -->
+    <uses-feature
+        android:name="com.oculus.feature.BOUNDARYLESS_APP"
+        android:required="false" />
+
     <application
         android:allowBackup="false"
         android:hasCode="false"

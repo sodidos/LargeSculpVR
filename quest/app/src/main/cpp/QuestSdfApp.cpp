@@ -3,9 +3,11 @@
 
 #include <algorithm>
 #include <array>
+#include <cctype>
 #include <chrono>
 #include <cmath>
 #include <cstdarg>
+#include <ctime>
 #include <cstddef>
 #include <cstdint>
 #include <cstdio>
@@ -24,6 +26,8 @@
 #include "core/SdfVolume.h"
 #include "core/ObjExporter.h"
 #include "core/SurfaceMesh.h"
+
+#include "HudPainter.h"
 
 #if LARGE_USE_OPENXR
 #include <openxr/openxr.h>
@@ -46,14 +50,11 @@ constexpr float kTriggerThreshold = 0.55f;
 constexpr float kGripThreshold = 0.55f;
 constexpr float kMinimumObjectScale = 0.05f;
 constexpr float kMaximumObjectScale = 10.00f;
-constexpr float kUiPanelWidthMeters = 0.17f;
-constexpr float kUiContentWidth = 264.0f;
-constexpr float kMenuContentHeight = 392.0f;
-constexpr float kMenuArButtonX = 220.0f;
-constexpr float kMenuArButtonY = 84.0f;
-constexpr float kMenuArButtonRadius = 18.0f;
 constexpr float kHandPinchDistance = 0.035f;
+constexpr float kHandPinchReleaseDistance = 0.052f;
 constexpr float kHandFistTipDistance = 0.090f;
+constexpr float kHandFistReleaseTipDistance = 0.112f;
+constexpr float kHandPoseSmoothing = 0.45f;  // fraction of the previous pose kept each frame
 constexpr float kHandStretchSurfaceSnapDistance = 0.080f;
 constexpr float kHandSculptSurfaceSnapDistance = 0.095f;
 constexpr float kHandOpenFingerDistance = 0.125f;
@@ -64,22 +65,43 @@ constexpr float kHandClapDistance = 0.115f;
 constexpr float kHandClapReleaseDistance = 0.195f;
 constexpr float kHandPinchZoomSpeed = 3.0f;
 constexpr float kControllerToolLength = 0.20f;
-constexpr float kHandAddStrength = 1.0f;
 constexpr float kHandSmoothStrength = 1.0f;
 constexpr float kHandEraseStrength = 1.0f;
-constexpr int kMenuToolCount = 4;
+constexpr int kMenuToolCount = 8;
 constexpr int kMenuFileActionCount = 4;
-constexpr int kMenuChoiceCount = kMenuToolCount + kMenuFileActionCount;
-constexpr int kMenuArChoice = kMenuChoiceCount;
+constexpr int kMenuArChoice = kMenuToolCount + kMenuFileActionCount;  // AR toggle row
+constexpr int kMenuMirrorChoice = kMenuArChoice + 1;                  // symmetry toggle row
+constexpr int kMenuLockChoice = kMenuMirrorChoice + 1;                // freeze object pose/scale
+constexpr int kMenuPaletteFirstChoice = kMenuLockChoice + 1;          // 8 paint color swatches
+constexpr int kMenuToggleChoice = 99;                                 // MENU header button
+static_assert(kMenuToolCount == large::hud::kMenuToolRowCount, "tool rows must match HUD layout");
+static_assert(kMenuFileActionCount + 3 == large::hud::kMenuActionRowCount,
+              "action rows must match HUD layout");
+
+// Paint palette (linear RGB); entry 0 is the default clay used to clear the color volume.
+constexpr std::array<std::array<float, 3>, large::hud::kPaletteCount> kPaintPalette{{
+    {0.86f, 0.68f, 0.54f},  // clay
+    {0.93f, 0.93f, 0.93f},  // white
+    {0.25f, 0.25f, 0.28f},  // graphite
+    {0.84f, 0.19f, 0.19f},  // red
+    {1.00f, 0.62f, 0.10f},  // orange
+    {1.00f, 0.87f, 0.35f},  // yellow
+    {0.18f, 0.80f, 0.44f},  // green
+    {0.20f, 0.60f, 0.86f},  // blue
+}};
 
 enum class VrTool {
   Add,
   Subtract,
   Smooth,
   Stretch,
+  Flatten,
+  Groove,
+  Crease,
+  Paint,
 };
 
-constexpr int kVrToolCount = 4;
+constexpr int kVrToolCount = 8;
 
 const char* toolName(VrTool tool) {
   switch (tool) {
@@ -91,36 +113,57 @@ const char* toolName(VrTool tool) {
       return "Smooth";
     case VrTool::Stretch:
       return "Stretch";
+    case VrTool::Flatten:
+      return "Flatten";
+    case VrTool::Groove:
+      return "Groove";
+    case VrTool::Crease:
+      return "Crease";
+    case VrTool::Paint:
+      return "Paint";
   }
   return "Unknown";
 }
 
+int toolIndex(VrTool tool) {
+  switch (tool) {
+    case VrTool::Add:
+      return 0;
+    case VrTool::Subtract:
+      return 1;
+    case VrTool::Smooth:
+      return 2;
+    case VrTool::Stretch:
+      return 3;
+    case VrTool::Flatten:
+      return 4;
+    case VrTool::Groove:
+      return 5;
+    case VrTool::Crease:
+      return 6;
+    case VrTool::Paint:
+      return 7;
+  }
+  return 0;
+}
+
 VrTool toolFromIndex(int index) {
+  constexpr std::array<VrTool, kVrToolCount> tools{
+      VrTool::Add,
+      VrTool::Subtract,
+      VrTool::Smooth,
+      VrTool::Stretch,
+      VrTool::Flatten,
+      VrTool::Groove,
+      VrTool::Crease,
+      VrTool::Paint,
+  };
   const int wrapped = (index % kVrToolCount + kVrToolCount) % kVrToolCount;
-  if (wrapped == 1) {
-    return VrTool::Subtract;
-  }
-  if (wrapped == 2) {
-    return VrTool::Smooth;
-  }
-  if (wrapped == 3) {
-    return VrTool::Stretch;
-  }
-  return VrTool::Add;
+  return tools[static_cast<std::size_t>(wrapped)];
 }
 
 VrTool nextHandTool(VrTool tool) {
-  switch (tool) {
-    case VrTool::Add:
-      return VrTool::Stretch;
-    case VrTool::Stretch:
-      return VrTool::Subtract;
-    case VrTool::Subtract:
-      return VrTool::Smooth;
-    case VrTool::Smooth:
-      return VrTool::Add;
-  }
-  return VrTool::Add;
+  return toolFromIndex(toolIndex(tool) + 1);
 }
 
 void logInfo(const char* format, ...) {
@@ -143,9 +186,9 @@ large::sdf::SdfVolume makeInitialVolume() {
   const float voxelSize = extent / static_cast<float>(resolution);
   const large::sdf::Vec3 origin{-extent * 0.5f, -extent * 0.5f, -extent * 0.5f};
 
-  large::sdf::SdfVolume volume({resolution, resolution, resolution}, voxelSize, origin, 10.0f);
-  volume.fillSphere({0.0f, 0.0f, 0.0f}, 0.55f);
-  return volume;
+  // The scene starts empty: the user creates the first material with the Add
+  // tool (trigger or hand pinch) inside the workspace bounds cube.
+  return large::sdf::SdfVolume({resolution, resolution, resolution}, voxelSize, origin, 10.0f);
 }
 
 #if LARGE_USE_OPENXR
@@ -935,9 +978,11 @@ class QuestSdfApp {
       return;
     }
 
+    // Created paused; xrPassthroughStartFB / LayerResumeFB run on toggle so
+    // the runtime never sees a "running but never submitted" layer state.
     XrPassthroughCreateInfoFB passthroughInfo{};
     passthroughInfo.type = XR_TYPE_PASSTHROUGH_CREATE_INFO_FB;
-    passthroughInfo.flags = XR_PASSTHROUGH_IS_RUNNING_AT_CREATION_BIT_FB;
+    passthroughInfo.flags = 0;
     XrResult result = xrCreatePassthroughFB_(xrSession_, &passthroughInfo, &passthrough_);
     if (XR_FAILED(result) || passthrough_ == XR_NULL_HANDLE) {
       logError("xrCreatePassthroughFB failed: %s", xrResultName(xrInstance_, result));
@@ -948,7 +993,7 @@ class QuestSdfApp {
     XrPassthroughLayerCreateInfoFB layerInfo{};
     layerInfo.type = XR_TYPE_PASSTHROUGH_LAYER_CREATE_INFO_FB;
     layerInfo.passthrough = passthrough_;
-    layerInfo.flags = XR_PASSTHROUGH_IS_RUNNING_AT_CREATION_BIT_FB;
+    layerInfo.flags = 0;
     layerInfo.purpose = XR_PASSTHROUGH_LAYER_PURPOSE_RECONSTRUCTION_FB;
     result = xrCreatePassthroughLayerFB_(xrSession_, &layerInfo, &passthroughLayer_);
     if (XR_FAILED(result) || passthroughLayer_ == XR_NULL_HANDLE) {
@@ -961,14 +1006,8 @@ class QuestSdfApp {
       return;
     }
 
-    XrPassthroughStyleFB style{};
-    style.type = XR_TYPE_PASSTHROUGH_STYLE_FB;
-    style.textureOpacityFactor = 0.45f;
-    style.edgeColor = {0.0f, 0.0f, 0.0f, 0.0f};
-    xrPassthroughLayerSetStyleFB_(passthroughLayer_, &style);
-
     passthroughReady_ = true;
-    logInfo("OpenXR passthrough ready");
+    logInfo("OpenXR passthrough ready (paused until AR toggle)");
   }
 
   void setArModeEnabled(bool enabled) {
@@ -984,21 +1023,26 @@ class QuestSdfApp {
 
     if (enabled) {
       XrResult result = xrPassthroughStartFB_(passthrough_);
+      logInfo("xrPassthroughStartFB: %s", xrResultName(xrInstance_, result));
       if (XR_FAILED(result)) {
-        logError("xrPassthroughStartFB failed: %s", xrResultName(xrInstance_, result));
         arModeEnabled_ = false;
         return;
       }
       result = xrPassthroughLayerResumeFB_(passthroughLayer_);
+      logInfo("xrPassthroughLayerResumeFB: %s", xrResultName(xrInstance_, result));
       if (XR_FAILED(result)) {
-        logError("xrPassthroughLayerResumeFB failed: %s", xrResultName(xrInstance_, result));
         xrPassthroughPauseFB_(passthrough_);
         arModeEnabled_ = false;
         return;
       }
+      XrPassthroughStyleFB style{};
+      style.type = XR_TYPE_PASSTHROUGH_STYLE_FB;
+      style.textureOpacityFactor = 1.0f;
+      style.edgeColor = {0.0f, 0.0f, 0.0f, 0.0f};
+      result = xrPassthroughLayerSetStyleFB_(passthroughLayer_, &style);
+      logInfo("xrPassthroughLayerSetStyleFB: %s", xrResultName(xrInstance_, result));
       arModeEnabled_ = true;
-      logInfo("AR passthrough enabled: compositor=opaque safe overlay, alphaBlendSupported=%d",
-              alphaBlendEnvironmentSupported_ ? 1 : 0);
+      logInfo("AR passthrough enabled");
       return;
     }
 
@@ -1221,6 +1265,19 @@ class QuestSdfApp {
       return false;
     }
 
+    XrActionCreateInfo rightStickInfo{};
+    rightStickInfo.type = XR_TYPE_ACTION_CREATE_INFO;
+    rightStickInfo.actionType = XR_ACTION_TYPE_VECTOR2F_INPUT;
+    std::strncpy(rightStickInfo.actionName, "locomotion", XR_MAX_ACTION_NAME_SIZE - 1);
+    std::strncpy(rightStickInfo.localizedActionName, "Locomotion", XR_MAX_LOCALIZED_ACTION_NAME_SIZE - 1);
+    rightStickInfo.countSubactionPaths = 1;
+    rightStickInfo.subactionPaths = &rightHandPath_;
+    if (!checkXr(xrInstance_,
+                 xrCreateAction(actionSet_, &rightStickInfo, &locomotionAction_),
+                 "xrCreateAction(locomotion)")) {
+      return false;
+    }
+
     XrActionCreateInfo undoInfo{};
     undoInfo.type = XR_TYPE_ACTION_CREATE_INFO;
     undoInfo.actionType = XR_ACTION_TYPE_BOOLEAN_INPUT;
@@ -1264,6 +1321,7 @@ class QuestSdfApp {
     XrPath leftGripPosePath = XR_NULL_PATH;
     XrPath leftGripValuePath = XR_NULL_PATH;
     XrPath leftStickPath = XR_NULL_PATH;
+    XrPath rightStickPath = XR_NULL_PATH;
     XrPath leftXPath = XR_NULL_PATH;
     XrPath leftYPath = XR_NULL_PATH;
     XrPath leftMenuPath = XR_NULL_PATH;
@@ -1285,6 +1343,9 @@ class QuestSdfApp {
         !checkXr(xrInstance_,
                  xrStringToPath(xrInstance_, "/user/hand/left/input/thumbstick", &leftStickPath),
                  "xrStringToPath(left thumbstick path)") ||
+        !checkXr(xrInstance_,
+                 xrStringToPath(xrInstance_, "/user/hand/right/input/thumbstick", &rightStickPath),
+                 "xrStringToPath(right thumbstick path)") ||
         !checkXr(xrInstance_,
                  xrStringToPath(xrInstance_, "/user/hand/left/input/x/click", &leftXPath),
                  "xrStringToPath(left X path)") ||
@@ -1315,10 +1376,11 @@ class QuestSdfApp {
       return false;
     }
 
-    std::array<XrActionSuggestedBinding, 12> bindings{{
+    std::array<XrActionSuggestedBinding, 13> bindings{{
         {gripPoseAction_, leftGripPosePath},
         {gripValueAction_, leftGripValuePath},
         {brushAdjustAction_, leftStickPath},
+        {locomotionAction_, rightStickPath},
         {undoAction_, leftXPath},
         {redoAction_, leftYPath},
         {menuAction_, leftMenuPath},
@@ -1518,7 +1580,7 @@ class QuestSdfApp {
           handleSessionState(*reinterpret_cast<const XrEventDataSessionStateChanged*>(&event));
           break;
         case XR_TYPE_EVENT_DATA_INSTANCE_LOSS_PENDING:
-          app_->destroyRequested = 1;
+          ANativeActivity_finish(app_->activity);
           break;
         default:
           break;
@@ -1542,7 +1604,9 @@ class QuestSdfApp {
       checkXr(xrInstance_, xrEndSession(xrSession_), "xrEndSession");
     } else if (xrSessionState_ == XR_SESSION_STATE_EXITING ||
                xrSessionState_ == XR_SESSION_STATE_LOSS_PENDING) {
-      app_->destroyRequested = 1;
+      // Finish the Android activity; the glue then delivers APP_CMD_DESTROY
+      // which sets destroyRequested through the normal lifecycle.
+      ANativeActivity_finish(app_->activity);
     }
   }
 
@@ -1575,6 +1639,7 @@ class QuestSdfApp {
 
     if (frameState.shouldRender && locateViews(frameState.predictedDisplayTime)) {
       updateControllerAndSculpt(frameState.predictedDisplayTime);
+      updateHudTexture();
       for (int eye = 0; eye < kEyeCount; ++eye) {
         renderEye(eye);
 
@@ -1586,20 +1651,28 @@ class QuestSdfApp {
         projectionViews[eye].subImage.imageRect.extent = {eyeSwapchains_[eye].width, eyeSwapchains_[eye].height};
       }
 
-      projectionLayer.type = XR_TYPE_COMPOSITION_LAYER_PROJECTION;
-      projectionLayer.layerFlags = 0;
-      projectionLayer.space = xrSpace_;
-      projectionLayer.viewCount = kEyeCount;
-      projectionLayer.views = projectionViews.data();
-      layers[layerCount++] = reinterpret_cast<const XrCompositionLayerBaseHeader*>(&projectionLayer);
-
-      if (arModeEnabled_ && passthroughReady_) {
+      // In AR the passthrough layer must sit *under* the projection layer,
+      // and the projection layer must alpha-blend over it (the SDF shader
+      // outputs alpha 0 on the background in AR mode).
+      const bool arActive = arModeEnabled_ && passthroughReady_;
+      if (arActive) {
         passthroughCompositionLayer.type = XR_TYPE_COMPOSITION_LAYER_PASSTHROUGH_FB;
-        passthroughCompositionLayer.space = xrSpace_;
+        passthroughCompositionLayer.flags = XR_COMPOSITION_LAYER_BLEND_TEXTURE_SOURCE_ALPHA_BIT;
+        passthroughCompositionLayer.space = XR_NULL_HANDLE;
         passthroughCompositionLayer.layerHandle = passthroughLayer_;
         layers[layerCount++] =
             reinterpret_cast<const XrCompositionLayerBaseHeader*>(&passthroughCompositionLayer);
       }
+
+      projectionLayer.type = XR_TYPE_COMPOSITION_LAYER_PROJECTION;
+      projectionLayer.layerFlags = arActive
+                                       ? (XR_COMPOSITION_LAYER_BLEND_TEXTURE_SOURCE_ALPHA_BIT |
+                                          XR_COMPOSITION_LAYER_UNPREMULTIPLIED_ALPHA_BIT)
+                                       : 0;
+      projectionLayer.space = xrSpace_;
+      projectionLayer.viewCount = kEyeCount;
+      projectionLayer.views = projectionViews.data();
+      layers[layerCount++] = reinterpret_cast<const XrCompositionLayerBaseHeader*>(&projectionLayer);
     }
 
     XrFrameEndInfo endInfo{};
@@ -1746,6 +1819,7 @@ class QuestSdfApp {
     rightHandPinchTool_ = -1;
     rightHandShapeBrushActive_ = false;
     rightHandShapeBrushTool_ = -1;
+    strokeHasLast_ = false;
   }
 
   void setActiveTool(VrTool tool, const char* source) {
@@ -1796,6 +1870,8 @@ class QuestSdfApp {
     if (undoDown && !undoWasDown_) {
       if (history_.undo()) {
         uploadSdfTexture();
+        markAllColorDirty();
+        uploadColorTexture();
         stretchSourceVolume_ = volume_;
         clearStretchInteraction();
         logInfo("Undo sculpt");
@@ -1807,6 +1883,8 @@ class QuestSdfApp {
     if (redoDown && !redoWasDown_) {
       if (history_.redo()) {
         uploadSdfTexture();
+        markAllColorDirty();
+        uploadColorTexture();
         stretchSourceVolume_ = volume_;
         clearStretchInteraction();
         logInfo("Redo sculpt");
@@ -1849,7 +1927,9 @@ class QuestSdfApp {
         throw std::runtime_error("open failed");
       }
 
-      constexpr char magic[8] = {'L', 'S', 'D', 'F', 'V', 'R', '1', '\0'};
+      // v2 appends the RGBA color volume after the SDF values; v1 files
+      // (SDF only) remain loadable.
+      constexpr char magic[8] = {'L', 'S', 'D', 'F', 'V', 'R', '2', '\0'};
       const large::sdf::IVec3 size = volume_.size();
       const std::int32_t dims[3] = {size.x, size.y, size.z};
       const float voxelSize = volume_.voxelSize();
@@ -1864,6 +1944,10 @@ class QuestSdfApp {
       out.write(reinterpret_cast<const char*>(&valueCount), sizeof(valueCount));
       out.write(reinterpret_cast<const char*>(volume_.values().data()),
                 static_cast<std::streamsize>(volume_.values().size() * sizeof(float)));
+      if (colorVoxels_.size() == valueCount * 4) {
+        out.write(reinterpret_cast<const char*>(colorVoxels_.data()),
+                  static_cast<std::streamsize>(colorVoxels_.size()));
+      }
       if (!out) {
         throw std::runtime_error("write failed");
       }
@@ -1893,9 +1977,12 @@ class QuestSdfApp {
       in.read(reinterpret_cast<char*>(originValues), sizeof(originValues));
       in.read(reinterpret_cast<char*>(&valueCount), sizeof(valueCount));
 
-      constexpr char expectedMagic[8] = {'L', 'S', 'D', 'F', 'V', 'R', '1', '\0'};
+      constexpr char magicV1[8] = {'L', 'S', 'D', 'F', 'V', 'R', '1', '\0'};
+      constexpr char magicV2[8] = {'L', 'S', 'D', 'F', 'V', 'R', '2', '\0'};
+      const bool isV1 = std::memcmp(magic, magicV1, sizeof(magicV1)) == 0;
+      const bool isV2 = std::memcmp(magic, magicV2, sizeof(magicV2)) == 0;
       const large::sdf::IVec3 size = volume_.size();
-      if (std::memcmp(magic, expectedMagic, sizeof(expectedMagic)) != 0 || dims[0] != size.x || dims[1] != size.y ||
+      if ((!isV1 && !isV2) || dims[0] != size.x || dims[1] != size.y ||
           dims[2] != size.z || valueCount != volume_.values().size()) {
         throw std::runtime_error("file does not match current volume");
       }
@@ -1909,30 +1996,203 @@ class QuestSdfApp {
         throw std::runtime_error("read failed");
       }
 
+      std::vector<std::uint8_t> colors;
+      if (isV2) {
+        colors.resize(static_cast<std::size_t>(valueCount) * 4);
+        in.read(reinterpret_cast<char*>(colors.data()), static_cast<std::streamsize>(colors.size()));
+        if (!in) {
+          throw std::runtime_error("color read failed");
+        }
+      }
+
       history_.capture();
       volume_.restoreValues(std::move(values));
+      if (isV2) {
+        colorVoxels_ = std::move(colors);
+        markAllColorDirty();
+      } else if (!colorVoxels_.empty()) {
+        // v1 files carry no paint: reset the color volume to clay.
+        initializeColorVoxels();
+      }
       stretchSourceVolume_ = volume_;
       clearStretchInteraction();
       uploadSdfTexture();
-      logInfo("Menu LOAD: %s", path.string().c_str());
+      uploadColorTexture();
+      logInfo("Menu LOAD: %s (%s)", path.string().c_str(), isV2 ? "v2" : "v1");
     } catch (const std::exception& e) {
       logError("Menu LOAD failed: %s", e.what());
     }
   }
 
+  // Copies a local file into the shared "Documents/LargeSculpVR" folder via
+  // MediaStore, so exports are visible in the Quest file manager and over USB
+  // without any storage permission.
+  bool publishFileToDocuments(const std::filesystem::path& source, const char* displayName) {
+    JavaVM* vm = app_->activity->vm;
+    JNIEnv* env = nullptr;
+    bool attachedHere = false;
+    if (vm->GetEnv(reinterpret_cast<void**>(&env), JNI_VERSION_1_6) != JNI_OK) {
+      if (vm->AttachCurrentThread(&env, nullptr) != JNI_OK || env == nullptr) {
+        logError("EXPORT publish: cannot attach JNI thread");
+        return false;
+      }
+      attachedHere = true;
+    }
+
+    const auto clearException = [&]() {
+      if (env->ExceptionCheck()) {
+        env->ExceptionDescribe();
+        env->ExceptionClear();
+        return true;
+      }
+      return false;
+    };
+
+    bool ok = false;
+    do {
+      const jobject activity = app_->activity->clazz;
+      const jclass activityClass = env->GetObjectClass(activity);
+      const jmethodID getResolver =
+          env->GetMethodID(activityClass, "getContentResolver", "()Landroid/content/ContentResolver;");
+      const jobject resolver = getResolver != nullptr ? env->CallObjectMethod(activity, getResolver) : nullptr;
+      if (clearException() || resolver == nullptr) {
+        break;
+      }
+
+      const jclass valuesClass = env->FindClass("android/content/ContentValues");
+      const jmethodID valuesCtor = env->GetMethodID(valuesClass, "<init>", "()V");
+      const jobject values = env->NewObject(valuesClass, valuesCtor);
+      const jmethodID putString =
+          env->GetMethodID(valuesClass, "put", "(Ljava/lang/String;Ljava/lang/String;)V");
+      if (clearException() || values == nullptr || putString == nullptr) {
+        break;
+      }
+      const auto putValue = [&](const char* key, const char* value) {
+        const jstring jKey = env->NewStringUTF(key);
+        const jstring jValue = env->NewStringUTF(value);
+        env->CallVoidMethod(values, putString, jKey, jValue);
+        env->DeleteLocalRef(jKey);
+        env->DeleteLocalRef(jValue);
+      };
+      putValue("_display_name", displayName);
+      putValue("mime_type", "application/octet-stream");
+      putValue("relative_path", "Documents/LargeSculpVR/");
+      if (clearException()) {
+        break;
+      }
+
+      const jclass filesClass = env->FindClass("android/provider/MediaStore$Files");
+      const jmethodID getContentUri =
+          env->GetStaticMethodID(filesClass, "getContentUri", "(Ljava/lang/String;)Landroid/net/Uri;");
+      const jstring volumeName = env->NewStringUTF("external");
+      const jobject collection = env->CallStaticObjectMethod(filesClass, getContentUri, volumeName);
+      if (clearException() || collection == nullptr) {
+        break;
+      }
+
+      const jclass resolverClass = env->GetObjectClass(resolver);
+      const jmethodID insert = env->GetMethodID(
+          resolverClass, "insert", "(Landroid/net/Uri;Landroid/content/ContentValues;)Landroid/net/Uri;");
+      const jobject uri = env->CallObjectMethod(resolver, insert, collection, values);
+      if (clearException() || uri == nullptr) {
+        logError("EXPORT publish: MediaStore insert failed");
+        break;
+      }
+
+      const jmethodID openOutputStream = env->GetMethodID(
+          resolverClass, "openOutputStream", "(Landroid/net/Uri;)Ljava/io/OutputStream;");
+      const jobject stream = env->CallObjectMethod(resolver, openOutputStream, uri);
+      if (clearException() || stream == nullptr) {
+        logError("EXPORT publish: openOutputStream failed");
+        break;
+      }
+
+      const jclass streamClass = env->GetObjectClass(stream);
+      const jmethodID writeMethod = env->GetMethodID(streamClass, "write", "([BII)V");
+      const jmethodID closeMethod = env->GetMethodID(streamClass, "close", "()V");
+
+      std::ifstream in(source, std::ios::binary);
+      std::vector<char> buffer(static_cast<std::size_t>(64) * 1024);
+      const jbyteArray jBuffer = env->NewByteArray(static_cast<jsize>(buffer.size()));
+      bool writeOk = in.good() && jBuffer != nullptr;
+      while (writeOk && in) {
+        in.read(buffer.data(), static_cast<std::streamsize>(buffer.size()));
+        const std::streamsize count = in.gcount();
+        if (count <= 0) {
+          break;
+        }
+        env->SetByteArrayRegion(jBuffer, 0, static_cast<jsize>(count),
+                                reinterpret_cast<const jbyte*>(buffer.data()));
+        env->CallVoidMethod(stream, writeMethod, jBuffer, 0, static_cast<jint>(count));
+        if (clearException()) {
+          writeOk = false;
+        }
+      }
+      env->CallVoidMethod(stream, closeMethod);
+      clearException();
+      ok = writeOk;
+    } while (false);
+
+    if (attachedHere) {
+      vm->DetachCurrentThread();
+    }
+    return ok;
+  }
+
   void exportSdfVolume() {
     try {
-      const std::filesystem::path path = appDataPath() / "large_sdf_export.obj";
-      const large::sdf::ObjExportStats stats = large::sdf::exportSdfSurfaceAsObj(volume_, path);
-      logInfo("Menu EXPORT: %s, vertices=%d faces=%d", path.string().c_str(), stats.vertices, stats.faces);
+      char fileName[64];
+      std::time_t now = std::time(nullptr);
+      std::tm timeInfo{};
+      localtime_r(&now, &timeInfo);
+      std::strftime(fileName, sizeof(fileName), "sculpt_%Y%m%d_%H%M%S.obj", &timeInfo);
+
+      const std::filesystem::path path = appDataPath() / fileName;
+      const large::sdf::ObjExportStats stats = large::sdf::exportSdfSurfaceAsObj(
+          volume_, path, colorVoxels_.empty() ? nullptr : colorVoxels_.data());
+      if (publishFileToDocuments(path, fileName)) {
+        logInfo("Menu EXPORT: Documents/LargeSculpVR/%s, vertices=%d faces=%d (vertex colors)",
+                fileName,
+                stats.vertices,
+                stats.faces);
+      } else {
+        logInfo("Menu EXPORT: %s (Documents copy failed), vertices=%d faces=%d",
+                path.string().c_str(),
+                stats.vertices,
+                stats.faces);
+      }
     } catch (const std::exception& e) {
       logError("Menu EXPORT failed: %s", e.what());
     }
   }
 
   void activateMenuChoice(int choice) {
+    if (choice == kMenuToggleChoice) {
+      menuVisible_ = !menuVisible_;
+      logInfo("Menu %s via panel button", menuVisible_ ? "opened" : "closed");
+      return;
+    }
+
     if (choice == kMenuArChoice) {
       setArModeEnabled(!arModeEnabled_);
+      return;
+    }
+
+    if (choice == kMenuMirrorChoice) {
+      mirrorEnabled_ = !mirrorEnabled_;
+      logInfo("Mirror mode %s", mirrorEnabled_ ? "enabled" : "disabled");
+      return;
+    }
+
+    if (choice == kMenuLockChoice) {
+      objectLocked_ = !objectLocked_;
+      logInfo("Object lock %s", objectLocked_ ? "enabled" : "disabled");
+      return;
+    }
+
+    if (choice >= kMenuPaletteFirstChoice && choice < kMenuPaletteFirstChoice + large::hud::kPaletteCount) {
+      paintColorIndex_ = choice - kMenuPaletteFirstChoice;
+      setActiveTool(VrTool::Paint, "Menu palette");
       return;
     }
 
@@ -1953,29 +2213,21 @@ class QuestSdfApp {
         break;
       case kMenuToolCount + 3:
         logInfo("Menu QUIT");
-        if (xrSession_ != XR_NULL_HANDLE) {
+        // Ask the runtime to end the session; the state machine then goes
+        // STOPPING -> xrEndSession -> EXITING -> activity finish. Forcing
+        // destroyRequested here would tear GL/XR down mid-frame and crash.
+        if (xrSession_ != XR_NULL_HANDLE && xrSessionRunning_) {
           xrRequestExitSession(xrSession_);
+        } else {
+          ANativeActivity_finish(app_->activity);
         }
-        app_->destroyRequested = 1;
         break;
       default:
         break;
     }
   }
 
-  int activeToolIndex() const {
-    switch (activeTool_) {
-      case VrTool::Add:
-        return 0;
-      case VrTool::Subtract:
-        return 1;
-      case VrTool::Smooth:
-        return 2;
-      case VrTool::Stretch:
-        return 3;
-    }
-    return 0;
-  }
+  int activeToolIndex() const { return toolIndex(activeTool_); }
 
   int displayToolIndex() const {
     return handDisplayToolIndex_ >= 0 ? handDisplayToolIndex_ : activeToolIndex();
@@ -2045,6 +2297,7 @@ class QuestSdfApp {
   }
 
   bool locateHandState(XrHandTrackerEXT tracker, HandState& state, XrTime predictedDisplayTime, const char* label) {
+    const HandState previous = state;
     state = {};
     if (!handTrackingReady_ || tracker == XR_NULL_HANDLE || xrLocateHandJointsEXT_ == nullptr) {
       return false;
@@ -2136,14 +2389,37 @@ class QuestSdfApp {
     const large::sdf::Vec3 indexDirection = large::sdf::normalize(indexTip - indexBase);
     state.indexDirection = large::sdf::dot(indexDirection, indexDirection) > 0.001f ? indexDirection : state.indexDirection;
     state.indexPointing = indexDistance > kHandFistTipDistance * 1.25f;
-    state.fist = indexDistance < kHandFistTipDistance && middleDistance < kHandFistTipDistance &&
-                 ringDistance < kHandFistTipDistance && littleDistance < kHandFistTipDistance &&
-                 thumbDistance < kHandFistTipDistance * 1.35f;
-    state.pinch = !state.fist && pinchDistance < kHandPinchDistance;
-    state.open = !state.fist && !state.pinch && pinchDistance > kHandOpenPinchDistance &&
-                 indexDistance > kHandOpenFingerDistance && middleDistance > kHandOpenFingerDistance &&
-                 ringDistance > kHandOpenFingerDistance * 0.92f &&
-                 littleDistance > kHandOpenLittleDistance && thumbDistance > kHandOpenThumbDistance;
+
+    // Hysteresis: a gesture engages below its trigger threshold but only
+    // releases above a wider one, so tracking jitter cannot make it flicker.
+    const float fistThreshold = previous.fist ? kHandFistReleaseTipDistance : kHandFistTipDistance;
+    state.fist = indexDistance < fistThreshold && middleDistance < fistThreshold &&
+                 ringDistance < fistThreshold && littleDistance < fistThreshold &&
+                 thumbDistance < fistThreshold * 1.35f;
+    const float pinchThreshold = previous.pinch ? kHandPinchReleaseDistance : kHandPinchDistance;
+    state.pinch = !state.fist && pinchDistance < pinchThreshold;
+    const float openScale = previous.open ? 0.90f : 1.0f;
+    state.open = !state.fist && !state.pinch && pinchDistance > kHandOpenPinchDistance * openScale &&
+                 indexDistance > kHandOpenFingerDistance * openScale &&
+                 middleDistance > kHandOpenFingerDistance * openScale &&
+                 ringDistance > kHandOpenFingerDistance * 0.92f * openScale &&
+                 littleDistance > kHandOpenLittleDistance * openScale &&
+                 thumbDistance > kHandOpenThumbDistance * openScale;
+
+    // Light exponential smoothing of the tracked positions to remove jitter
+    // while sculpting; gestures above already work on the raw values.
+    if (previous.active) {
+      const auto smooth = [](large::sdf::Vec3 prev, large::sdf::Vec3 next) {
+        return prev * kHandPoseSmoothing + next * (1.0f - kHandPoseSmoothing);
+      };
+      state.pose.position = smooth(previous.pose.position, state.pose.position);
+      state.pinchPosition = smooth(previous.pinchPosition, state.pinchPosition);
+      state.openToolPosition = smooth(previous.openToolPosition, state.openToolPosition);
+      state.fistToolPosition = smooth(previous.fistToolPosition, state.fistToolPosition);
+      for (std::size_t i = 0; i < state.joints.size(); ++i) {
+        state.joints[i] = smooth(previous.joints[i], state.joints[i]);
+      }
+    }
     return true;
   }
 
@@ -2258,10 +2534,11 @@ class QuestSdfApp {
     large::sdf::Vec3 right{1.0f, 0.0f, 0.0f};
     large::sdf::Vec3 up{0.0f, 1.0f, 0.0f};
     float height = 0.0f;
+    float contentHeight = 0.0f;  // visible pixels (header only, or full menu)
   };
 
   bool leftUiPanelFrame(UiPanelFrame& frame) const {
-    if (!menuVisible_ || !isLeftUiVisible()) {
+    if (!isLeftUiVisible()) {
       return false;
     }
 
@@ -2275,38 +2552,74 @@ class QuestSdfApp {
       frame.right = large::sdf::normalize(frame.right);
     }
     frame.up = large::sdf::normalize(large::sdf::cross(frame.forward, frame.right));
-    frame.height = kUiPanelWidthMeters * kMenuContentHeight / kUiContentWidth;
+    frame.contentHeight =
+        static_cast<float>(menuVisible_ ? large::hud::kContentHeight : large::hud::kHeaderVisibleHeight);
+    frame.height = large::hud::kPanelWidthMeters * frame.contentHeight /
+                   static_cast<float>(large::hud::kContentWidth);
     return true;
   }
 
   bool resolveLeftUiHit(const UiPanelFrame& frame, large::sdf::Vec3 point, UiPointerHit& hit) const {
+    namespace hud = large::hud;
     const large::sdf::Vec3 offset = point - frame.center;
     const float localX = large::sdf::dot(offset, frame.right);
     const float localY = large::sdf::dot(offset, frame.up);
-    if (std::abs(localX) > kUiPanelWidthMeters * 0.5f || std::abs(localY) > frame.height * 0.5f) {
+    if (std::abs(localX) > hud::kPanelWidthMeters * 0.5f || std::abs(localY) > frame.height * 0.5f) {
       return false;
     }
 
-    const float fragX = (localX / kUiPanelWidthMeters + 0.5f) * kUiContentWidth;
-    const float fragY = (0.5f - localY / frame.height) * kMenuContentHeight;
+    // Same mapping as the UI overlay shader, so the pointer hits exactly what
+    // is drawn on the HUD texture.
+    const float fragX = (localX / hud::kPanelWidthMeters + 0.5f) * static_cast<float>(hud::kContentWidth);
+    const float fragY = (0.5f - localY / frame.height) * frame.contentHeight;
 
     hit.point = point;
     hit.menuChoice = -1;
-    const float arDx = fragX - kMenuArButtonX;
-    const float arDy = fragY - kMenuArButtonY;
-    if (arDx * arDx + arDy * arDy <= kMenuArButtonRadius * kMenuArButtonRadius) {
-      hit.menuChoice = kMenuArChoice;
+
+    const bool onMenuButton = fragX >= static_cast<float>(hud::kMenuButtonLeft) &&
+                              fragX <= static_cast<float>(hud::kMenuButtonRight) &&
+                              fragY >= static_cast<float>(hud::kMenuButtonTop) &&
+                              fragY <= static_cast<float>(hud::kMenuButtonBottom);
+    if (onMenuButton) {
+      hit.menuChoice = kMenuToggleChoice;
       return true;
     }
 
-    if (fragX >= 28.0f && fragX <= 226.0f) {
-      for (int i = 0; i < kMenuChoiceCount; ++i) {
-        const float rowTop = 132.0f + static_cast<float>(i) * 29.0f;
-        const float rowBottom = rowTop + 23.0f;
+    // With the menu closed, only the MENU button is interactive: the rest of
+    // the header must not block sculpting near the left hand.
+    if (!menuVisible_) {
+      return false;
+    }
+
+    const bool inToolColumn = fragX >= static_cast<float>(hud::kMenuToolColumnLeft) &&
+                              fragX <= static_cast<float>(hud::kMenuToolColumnRight);
+    const bool inActionColumn = fragX >= static_cast<float>(hud::kMenuActionColumnLeft) &&
+                                fragX <= static_cast<float>(hud::kMenuActionColumnRight);
+    if (inToolColumn || inActionColumn) {
+      const int rowCount = inToolColumn ? hud::kMenuToolRowCount : hud::kMenuActionRowCount;
+      for (int i = 0; i < rowCount; ++i) {
+        const float rowTop = static_cast<float>(hud::kMenuRowTop + i * hud::kMenuRowPitch);
+        const float rowBottom = rowTop + static_cast<float>(hud::kMenuRowHeight);
         if (fragY >= rowTop && fragY <= rowBottom) {
-          hit.menuChoice = i;
-          break;
+          hit.menuChoice = inToolColumn ? i : kMenuToolCount + i;
+          return true;
         }
+      }
+    }
+
+    const float paletteX = fragX - static_cast<float>(hud::kPaletteLeft);
+    const float paletteY = fragY - static_cast<float>(hud::kPaletteTop);
+    if (paletteX >= 0.0f && paletteY >= 0.0f) {
+      const int column = static_cast<int>(std::floor(paletteX / static_cast<float>(hud::kPalettePitch)));
+      const int row = static_cast<int>(std::floor(paletteY / static_cast<float>(hud::kPalettePitch)));
+      const bool inColumn = column >= 0 && column < hud::kPaletteColumns &&
+                            paletteX - static_cast<float>(column * hud::kPalettePitch) <=
+                                static_cast<float>(hud::kPaletteSwatch);
+      const bool inRow = row >= 0 && row < hud::kPaletteRows &&
+                         paletteY - static_cast<float>(row * hud::kPalettePitch) <=
+                             static_cast<float>(hud::kPaletteSwatch);
+      if (inColumn && inRow) {
+        hit.menuChoice = kMenuPaletteFirstChoice + row * hud::kPaletteColumns + column;
       }
     }
     return true;
@@ -2331,6 +2644,51 @@ class QuestSdfApp {
     const large::sdf::Vec3 point = rayOrigin + rayDirection * t;
     hit.signedDistance = 0.0f;
     return resolveLeftUiHit(frame, point, hit);
+  }
+
+  // Direct touch for hand tracking: the right index fingertip hovers and
+  // presses the wrist panel (menu rows, palette, MENU button). Returns true
+  // while the fingertip is in the panel interaction zone, which also
+  // suppresses sculpting so a pinch near the panel cannot carve the object.
+  bool updateHandMenuPoke() {
+    if (!rightHandState_.active || !isLeftUiVisible()) {
+      handPokeWasTouching_ = false;
+      return false;
+    }
+
+    UiPanelFrame frame{};
+    if (!leftUiPanelFrame(frame)) {
+      handPokeWasTouching_ = false;
+      return false;
+    }
+
+    const large::sdf::Vec3 tip = rightHandState_.indexTip;
+    const float planeDistance = large::sdf::dot(tip - frame.center, frame.forward);
+    if (planeDistance > 0.10f || planeDistance < -0.05f) {
+      handPokeWasTouching_ = false;
+      return false;
+    }
+
+    const large::sdf::Vec3 onPlane = tip - frame.forward * planeDistance;
+    UiPointerHit hit{};
+    if (!resolveLeftUiHit(frame, onPlane, hit)) {
+      handPokeWasTouching_ = false;
+      return false;
+    }
+
+    menuPointerActive_ = true;
+    menuHoverIndex_ = hit.menuChoice;
+    menuPointerStart_ = tip;
+    menuPointerEnd_ = onPlane;
+
+    // Press on plane contact, with hysteresis so a trembling fingertip does
+    // not double-trigger.
+    const bool touching = planeDistance < (handPokeWasTouching_ ? 0.030f : 0.012f);
+    if (touching && !handPokeWasTouching_ && hit.menuChoice >= 0) {
+      activateMenuChoice(hit.menuChoice);
+    }
+    handPokeWasTouching_ = touching;
+    return true;
   }
 
   bool updateMenuPointer(large::sdf::Vec3 rayOrigin, large::sdf::Vec3 rayDirection, bool selectDown) {
@@ -2365,6 +2723,17 @@ class QuestSdfApp {
     rightGripPose_ = locateControllerPose(
         gripPoseAction_, rightHandPath_, rightGripSpace_, predictedDisplayTime, gripFlags, "right grip");
     updateHandTracking(predictedDisplayTime);
+
+    // LOCK mode: the object's pose and scale are frozen; grips and hand
+    // grabs no longer move it (the left grip still drives the wrist UI).
+    if (objectLocked_) {
+      leftGripActive_ = false;
+      rightGripActive_ = false;
+      oneHandGrabActive_ = false;
+      oneHandGrabHand_ = 0;
+      twoHandGrabActive_ = false;
+      return;
+    }
 
     const bool leftHandGrab = leftHandState_.active && leftHandState_.fist;
     const bool rightHandGrab = false;
@@ -2434,7 +2803,50 @@ class QuestSdfApp {
     oneHandGrabHand_ = 0;
   }
 
+  // Right-stick locomotion: the user moves through the scene. In tracking
+  // space this shifts the object (and the procedural room, via uWorldOffset)
+  // in the opposite direction, which is also the only visible effect in AR.
+  void updateLocomotion(XrTime predictedDisplayTime) {
+    const XrVector2f stick = readVector2Action(locomotionAction_, rightHandPath_, "locomotion");
+
+    float dt = 1.0f / 72.0f;
+    if (lastLocomotionTime_ != 0) {
+      dt = large::sdf::clamp(static_cast<float>(predictedDisplayTime - lastLocomotionTime_) * 1e-9f, 0.0f, 0.05f);
+    }
+    lastLocomotionTime_ = predictedDisplayTime;
+
+    constexpr float deadzone = 0.15f;
+    if (std::abs(stick.x) < deadzone && std::abs(stick.y) < deadzone) {
+      return;
+    }
+
+    large::sdf::Vec3 forward = rotateByQuaternion(views_[0].pose.orientation, {0.0f, 0.0f, -1.0f});
+    forward.y = 0.0f;
+    if (large::sdf::dot(forward, forward) < 0.001f) {
+      forward = {0.0f, 0.0f, -1.0f};
+    }
+    forward = large::sdf::normalize(forward);
+    large::sdf::Vec3 right = rotateByQuaternion(views_[0].pose.orientation, {1.0f, 0.0f, 0.0f});
+    right.y = 0.0f;
+    if (large::sdf::dot(right, right) < 0.001f) {
+      right = {1.0f, 0.0f, 0.0f};
+    }
+    right = large::sdf::normalize(right);
+
+    constexpr float speed = 1.6f;  // meters per second at full stick
+    const large::sdf::Vec3 move = (right * stick.x + forward * stick.y) * (speed * dt);
+    worldOffset_ = worldOffset_ + move;
+    // While the object is held it stays in the hand; only the room scrolls.
+    if (!oneHandGrabActive_ && !twoHandGrabActive_) {
+      objectPosition_ = objectPosition_ - move;
+    }
+  }
+
   void updateLeftHandPinchZoom() {
+    if (objectLocked_) {
+      leftHandPinchZoomActive_ = false;
+      return;
+    }
     if (!leftHandState_.active || !leftHandState_.pinch || leftHandState_.fist) {
       leftHandPinchZoomActive_ = false;
       return;
@@ -2454,19 +2866,178 @@ class QuestSdfApp {
                                      kMaximumObjectScale);
   }
 
-  void applyActiveSculptTool(large::sdf::Vec3 center, float localBrushRadius) {
+  // Starts a sculpt stroke: resets the capsule chaining and, for Flatten,
+  // locks the work plane on the surface point under the brush so the whole
+  // stroke flattens toward the same plane (Medium-style flatten).
+  void beginSculptStroke(large::sdf::Vec3 centerLocal, bool hasContact, large::sdf::Vec3 contactLocal) {
+    strokeHasLast_ = false;
+    if (activeTool_ == VrTool::Flatten) {
+      const large::sdf::Vec3 planePoint = hasContact ? contactLocal : centerLocal;
+      flattenPlanePointLocal_ = planePoint;
+      flattenPlaneNormalLocal_ = estimateSdfNormalLocal(planePoint);
+    }
+  }
+
+  // The symmetry plane is local X=0 (the volume is centered on the origin).
+  static large::sdf::Vec3 mirrorLocal(large::sdf::Vec3 p) { return {-p.x, p.y, p.z}; }
+
+  void applySculptStampAt(large::sdf::Vec3 from,
+                          large::sdf::Vec3 centerLocal,
+                          large::sdf::Vec3 flattenPoint,
+                          large::sdf::Vec3 flattenNormal,
+                          float localBrushRadius,
+                          float strength) {
     switch (activeTool_) {
       case VrTool::Add:
-        volume_.applySphereBrush(center, localBrushRadius, large::sdf::BrushMode::Add, brushStrength_);
+        volume_.applyCapsuleBrush(from, centerLocal, localBrushRadius, large::sdf::BrushMode::Add, strength);
         break;
       case VrTool::Subtract:
-        volume_.applySphereBrush(center, localBrushRadius, large::sdf::BrushMode::Subtract, brushStrength_);
+        volume_.applyCapsuleBrush(from, centerLocal, localBrushRadius, large::sdf::BrushMode::Subtract, strength);
         break;
       case VrTool::Smooth:
-        volume_.applySmoothBrush(center, localBrushRadius * 1.35f, brushStrength_ * 0.65f);
+        volume_.applySmoothBrush(centerLocal, localBrushRadius * 1.35f, strength * 0.65f);
+        break;
+      case VrTool::Flatten:
+        volume_.applyFlattenBrush(centerLocal, flattenPoint, flattenNormal, localBrushRadius * 1.25f, strength);
+        break;
+      case VrTool::Groove:
+        volume_.applyCapsuleBrush(from,
+                                  centerLocal,
+                                  std::max(localBrushRadius * 0.35f, volume_.voxelSize()),
+                                  large::sdf::BrushMode::Subtract,
+                                  strength);
+        break;
+      case VrTool::Crease:
+        volume_.applyPinchBrush(centerLocal, localBrushRadius, strength);
+        break;
+      case VrTool::Paint:
+        applyPaintStroke(from, centerLocal, localBrushRadius);
         break;
       case VrTool::Stretch:
         break;
+    }
+  }
+
+  // Applies one stamp of the active tool. Successive stamps are connected by
+  // capsules so fast strokes stay continuous instead of leaving sphere gaps.
+  // With mirror mode on, every stamp is duplicated across the X=0 plane
+  // (Stretch is the only tool left out of the symmetry).
+  void applySculptStamp(large::sdf::Vec3 centerLocal, float localBrushRadius, float strength) {
+    const large::sdf::Vec3 from = strokeHasLast_ ? strokeLastLocal_ : centerLocal;
+    applySculptStampAt(from, centerLocal, flattenPlanePointLocal_, flattenPlaneNormalLocal_, localBrushRadius,
+                       strength);
+    if (mirrorEnabled_) {
+      applySculptStampAt(mirrorLocal(from),
+                         mirrorLocal(centerLocal),
+                         mirrorLocal(flattenPlanePointLocal_),
+                         {-flattenPlaneNormalLocal_.x, flattenPlaneNormalLocal_.y, flattenPlaneNormalLocal_.z},
+                         localBrushRadius,
+                         strength);
+    }
+    strokeLastLocal_ = centerLocal;
+    strokeHasLast_ = true;
+  }
+
+  void initializeColorVoxels() {
+    const std::size_t count = volume_.values().size();
+    const auto& clay = kPaintPalette[0];
+    const std::uint8_t r = static_cast<std::uint8_t>(clay[0] * 255.0f + 0.5f);
+    const std::uint8_t g = static_cast<std::uint8_t>(clay[1] * 255.0f + 0.5f);
+    const std::uint8_t b = static_cast<std::uint8_t>(clay[2] * 255.0f + 0.5f);
+    colorVoxels_.resize(count * 4);
+    for (std::size_t i = 0; i < count; ++i) {
+      colorVoxels_[i * 4 + 0] = r;
+      colorVoxels_[i * 4 + 1] = g;
+      colorVoxels_[i * 4 + 2] = b;
+      colorVoxels_[i * 4 + 3] = 255;
+    }
+    markAllColorDirty();
+    // From here on, undo/redo snapshots also carry the paint colors.
+    history_.attachColors(&colorVoxels_);
+  }
+
+  void markAllColorDirty() {
+    const large::sdf::IVec3 size = volume_.size();
+    colorDirtyBounds_.valid = true;
+    colorDirtyBounds_.min = {0, 0, 0};
+    colorDirtyBounds_.max = {size.x - 1, size.y - 1, size.z - 1};
+  }
+
+  // Blends the paint color into the color volume along a capsule, restricted
+  // to a narrow band around the current surface.
+  void applyPaintStroke(large::sdf::Vec3 from, large::sdf::Vec3 to, float localRadius) {
+    if (localRadius <= 0.0f || colorVoxels_.empty()) {
+      return;
+    }
+
+    const large::sdf::IVec3 size = volume_.size();
+    const float voxelSize = volume_.voxelSize();
+    const large::sdf::Vec3 origin = volume_.origin();
+    const float band = voxelSize * 4.0f;
+    const auto& paint = kPaintPalette[static_cast<std::size_t>(paintColorIndex_)];
+
+    const large::sdf::Vec3 minPoint{
+        std::min(from.x, to.x) - localRadius,
+        std::min(from.y, to.y) - localRadius,
+        std::min(from.z, to.z) - localRadius,
+    };
+    const large::sdf::Vec3 maxPoint{
+        std::max(from.x, to.x) + localRadius,
+        std::max(from.y, to.y) + localRadius,
+        std::max(from.z, to.z) + localRadius,
+    };
+    const int minX = large::sdf::clampInt(static_cast<int>(std::floor((minPoint.x - origin.x) / voxelSize)), 0, size.x - 1);
+    const int minY = large::sdf::clampInt(static_cast<int>(std::floor((minPoint.y - origin.y) / voxelSize)), 0, size.y - 1);
+    const int minZ = large::sdf::clampInt(static_cast<int>(std::floor((minPoint.z - origin.z) / voxelSize)), 0, size.z - 1);
+    const int maxX = large::sdf::clampInt(static_cast<int>(std::ceil((maxPoint.x - origin.x) / voxelSize)), 0, size.x - 1);
+    const int maxY = large::sdf::clampInt(static_cast<int>(std::ceil((maxPoint.y - origin.y) / voxelSize)), 0, size.y - 1);
+    const int maxZ = large::sdf::clampInt(static_cast<int>(std::ceil((maxPoint.z - origin.z) / voxelSize)), 0, size.z - 1);
+
+    const large::sdf::Vec3 segment = to - from;
+    const float segmentLengthSq = large::sdf::dot(segment, segment);
+    const std::vector<float>& values = volume_.values();
+    bool painted = false;
+
+    for (int z = minZ; z <= maxZ; ++z) {
+      for (int y = minY; y <= maxY; ++y) {
+        for (int x = minX; x <= maxX; ++x) {
+          const std::size_t i = volume_.index(x, y, z);
+          // Paint the interior too (values <= band keeps all solid voxels):
+          // a surface-only shell gets diluted by the trilinear color filter
+          // and only shows up along edges.
+          if (values[i] > band) {
+            continue;
+          }
+
+          const large::sdf::Vec3 p = volume_.voxelCenter(x, y, z);
+          const large::sdf::Vec3 toPoint = p - from;
+          const float h = segmentLengthSq > 0.000001f
+                              ? large::sdf::clamp(large::sdf::dot(toPoint, segment) / segmentLengthSq, 0.0f, 1.0f)
+                              : 0.0f;
+          const float dist = large::sdf::length(toPoint - segment * h);
+          if (dist > localRadius) {
+            continue;
+          }
+
+          const float falloff = 1.0f - (dist / localRadius) * (dist / localRadius);
+          const float blend = large::sdf::clamp(brushStrength_ * falloff, 0.0f, 1.0f);
+          std::uint8_t* voxel = colorVoxels_.data() + i * 4;
+          for (int channel = 0; channel < 3; ++channel) {
+            const float current = static_cast<float>(voxel[channel]) / 255.0f;
+            const float next = current + (paint[static_cast<std::size_t>(channel)] - current) * blend;
+            voxel[channel] = static_cast<std::uint8_t>(large::sdf::clamp(next, 0.0f, 1.0f) * 255.0f + 0.5f);
+          }
+          painted = true;
+        }
+      }
+    }
+
+    if (painted) {
+      large::sdf::VoxelBounds stampBounds{};
+      stampBounds.valid = true;
+      stampBounds.min = {minX, minY, minZ};
+      stampBounds.max = {maxX, maxY, maxZ};
+      colorDirtyBounds_ = mergeVoxelBounds(colorDirtyBounds_, stampBounds);
     }
   }
 
@@ -2523,6 +3094,18 @@ class QuestSdfApp {
                                 rotationZ,
                                 influenceRadius,
                                 brushStrength_);
+      if (mirrorEnabled_) {
+        // Mirrored rotation basis: R' = M R M with M = diag(-1, 1, 1).
+        volume_.applyStretchBrush(stretchSourceVolume_,
+                                  mirrorLocal(stretchAnchorLocal_),
+                                  mirrorLocal(delta),
+                                  {rotationX.x, -rotationX.y, -rotationX.z},
+                                  {-rotationY.x, rotationY.y, rotationY.z},
+                                  {-rotationZ.x, rotationZ.y, rotationZ.z},
+                                  influenceRadius,
+                                  brushStrength_,
+                                  false);
+      }
       const large::sdf::VoxelBounds currentStretchBounds = volume_.dirtyBounds();
       uploadSdfTexture(previousStretchBounds);
       stretchUploadBounds_ = currentStretchBounds;
@@ -2588,8 +3171,8 @@ class QuestSdfApp {
     rightHandShapeBrushActive_ = false;
     rightHandShapeBrushTool_ = -1;
     const float influenceRadius = handGestureLocalRadius(localBrushRadius);
-    const int toolIndex = activeToolIndex();
-    handDisplayToolIndex_ = toolIndex;
+    const int activeIndex = activeToolIndex();
+    handDisplayToolIndex_ = activeIndex;
     const large::sdf::Vec3 pinchLocal = worldToObjectPoint(rightHandState_.pinchPosition);
     const float surfaceDistance = std::abs(volume_.sample(pinchLocal));
     const float snapDistance = std::max(kHandSculptSurfaceSnapDistance / std::max(objectScale_, 0.001f),
@@ -2599,37 +3182,39 @@ class QuestSdfApp {
       rightHandPinchStretchActive_ = false;
       rightHandPinchWasActive_ = false;
       stretchPullActive_ = false;
-      brushVisible_ = surfaceDistance <= std::max(influenceRadius * 1.15f, snapDistance);
+      const bool nearSurface = surfaceDistance <= std::max(influenceRadius * 1.15f, snapDistance);
+      // Add can create material in empty space (needed for the empty start
+      // scene); the other tools need an existing surface to act on.
+      brushVisible_ = nearSurface || activeTool_ == VrTool::Add;
       brushHitLocal_ = pinchLocal;
       brushHitWorld_ = objectToWorldPoint(pinchLocal);
-      if (!brushVisible_) {
+      if (!nearSurface && activeTool_ != VrTool::Add) {
         rightHandPinchToolActive_ = false;
         rightHandPinchTool_ = -1;
+        strokeHasLast_ = false;
         return true;
       }
 
       if (frameCounter_ >= nextSculptFrame_) {
-        if (!rightHandPinchToolActive_ || rightHandPinchTool_ != toolIndex) {
+        if (!rightHandPinchToolActive_ || rightHandPinchTool_ != activeIndex) {
           history_.capture();
+          large::sdf::Vec3 contactLocal = pinchLocal;
+          const bool hasContact = findToolSurfaceContact(pinchLocal, influenceRadius, contactLocal);
+          beginSculptStroke(pinchLocal, hasContact, contactLocal);
         }
 
-        switch (activeTool_) {
-          case VrTool::Add:
-            volume_.applySphereBrush(pinchLocal, influenceRadius, large::sdf::BrushMode::Add, kHandAddStrength);
-            break;
-          case VrTool::Subtract:
-            volume_.applySphereBrush(pinchLocal, influenceRadius, large::sdf::BrushMode::Subtract, kHandEraseStrength);
-            break;
-          case VrTool::Smooth:
-            volume_.applySmoothBrush(pinchLocal, influenceRadius * 1.35f, kHandSmoothStrength);
-            break;
-          case VrTool::Stretch:
-            break;
-        }
+        applySculptStamp(pinchLocal, influenceRadius, 1.0f);
 
         rightHandPinchToolActive_ = true;
-        rightHandPinchTool_ = toolIndex;
+        rightHandPinchTool_ = activeIndex;
+        if (activeTool_ == VrTool::Flatten) {
+          flattenPreviewCenterWorld_ = objectToWorldPoint(flattenPlanePointLocal_);
+          flattenPreviewNormalWorld_ =
+              large::sdf::normalize(rotateByQuaternion(objectRotation_, flattenPlaneNormalLocal_));
+          flattenPreviewVisible_ = true;
+        }
         uploadSdfTexture();
+        uploadColorTexture();
         nextSculptFrame_ = frameCounter_ + (activeTool_ == VrTool::Smooth ? 3 : 2);
         if (frameCounter_ >= nextSculptLogFrame_) {
           logInfo("Hand %s pinch: center=(%.2f %.2f %.2f), radius=%.2f",
@@ -2675,6 +3260,14 @@ class QuestSdfApp {
     if (large::sdf::length(delta) > volume_.voxelSize() * 0.35f && frameCounter_ >= nextSculptFrame_) {
       const large::sdf::VoxelBounds previousStretchBounds = stretchUploadBounds_;
       volume_.applyStretchBrush(stretchSourceVolume_, stretchAnchorLocal_, delta, influenceRadius, 1.0f);
+      if (mirrorEnabled_) {
+        volume_.applyStretchBrush(stretchSourceVolume_,
+                                  mirrorLocal(stretchAnchorLocal_),
+                                  mirrorLocal(delta),
+                                  influenceRadius,
+                                  1.0f,
+                                  false);
+      }
       const large::sdf::VoxelBounds currentStretchBounds = volume_.dirtyBounds();
       uploadSdfTexture(previousStretchBounds);
       stretchUploadBounds_ = currentStretchBounds;
@@ -2706,7 +3299,7 @@ class QuestSdfApp {
       return false;
     }
 
-    const int toolIndex = erase ? 1 : 2;
+    const int gestureToolIndex = erase ? 1 : 2;
     const large::sdf::Vec3 centerWorld = erase ? rightHandState_.fistToolPosition : rightHandState_.openToolPosition;
     const large::sdf::Vec3 centerLocal = worldToObjectPoint(centerWorld);
     const float localRadius = handGestureLocalRadius(localBrushRadius);
@@ -2714,7 +3307,7 @@ class QuestSdfApp {
     const float snapDistance =
         std::max(kHandSculptSurfaceSnapDistance / std::max(objectScale_, 0.001f), volume_.voxelSize() * 2.0f);
 
-    handDisplayToolIndex_ = toolIndex;
+    handDisplayToolIndex_ = gestureToolIndex;
     stretchPullActive_ = false;
     brushVisible_ = surfaceDistance <= std::max(localRadius * 1.15f, snapDistance);
     brushHitLocal_ = centerLocal;
@@ -2726,7 +3319,7 @@ class QuestSdfApp {
     }
 
     if (frameCounter_ >= nextSculptFrame_) {
-      if (!rightHandShapeBrushActive_ || rightHandShapeBrushTool_ != toolIndex) {
+      if (!rightHandShapeBrushActive_ || rightHandShapeBrushTool_ != gestureToolIndex) {
         history_.capture();
       }
 
@@ -2737,7 +3330,7 @@ class QuestSdfApp {
       }
 
       rightHandShapeBrushActive_ = true;
-      rightHandShapeBrushTool_ = toolIndex;
+      rightHandShapeBrushTool_ = gestureToolIndex;
       uploadSdfTexture();
       nextSculptFrame_ = frameCounter_ + (smooth ? 3 : 2);
       if (frameCounter_ >= nextSculptLogFrame_) {
@@ -2780,6 +3373,7 @@ class QuestSdfApp {
     }
 
     updateObjectManipulation(predictedDisplayTime);
+    updateLocomotion(predictedDisplayTime);
     updateLeftHandPinchZoom();
     updateBrushAdjustments();
     updateToolButtons();
@@ -2788,6 +3382,7 @@ class QuestSdfApp {
     const bool triggerDown = rightTriggerValue_ >= kTriggerThreshold;
     const float localBrushRadius = brushRadius_ / std::max(objectScale_, 0.001f);
     handDisplayToolIndex_ = -1;
+    flattenPreviewVisible_ = false;
     if (!triggerDown) {
       rightControllerToolStrokeActive_ = false;
     }
@@ -2797,6 +3392,13 @@ class QuestSdfApp {
       rightToolVisible_ = false;
       menuPointerActive_ = false;
       menuHoverIndex_ = -1;
+      rightTriggerWasDown_ = triggerDown;
+      return;
+    }
+
+    if (updateHandMenuPoke()) {
+      brushVisible_ = false;
+      rightToolVisible_ = false;
       rightTriggerWasDown_ = triggerDown;
       return;
     }
@@ -2846,6 +3448,22 @@ class QuestSdfApp {
     brushHitLocal_ = toolCenterLocal;
     brushHitWorld_ = toolCenterWorld;
 
+    // Flatten preview: before pressing, show the tangent plane that would be
+    // locked; during a stroke, show the locked plane itself.
+    if (activeTool_ == VrTool::Flatten) {
+      if (rightControllerToolStrokeActive_ && triggerDown) {
+        flattenPreviewCenterWorld_ = objectToWorldPoint(flattenPlanePointLocal_);
+        flattenPreviewNormalWorld_ =
+            large::sdf::normalize(rotateByQuaternion(objectRotation_, flattenPlaneNormalLocal_));
+        flattenPreviewVisible_ = true;
+      } else if (toolInContact) {
+        flattenPreviewCenterWorld_ = objectToWorldPoint(contactLocal);
+        flattenPreviewNormalWorld_ = large::sdf::normalize(
+            rotateByQuaternion(objectRotation_, estimateSdfNormalLocal(contactLocal)));
+        flattenPreviewVisible_ = true;
+      }
+    }
+
     if (activeTool_ == VrTool::Stretch) {
       if (!triggerDown) {
         brushVisible_ = toolInContact;
@@ -2879,6 +3497,7 @@ class QuestSdfApp {
     const bool addInEmptySpace = activeTool_ == VrTool::Add && triggerDown;
     if (!toolInContact && !addInEmptySpace) {
       brushVisible_ = false;
+      strokeHasLast_ = false;
       rightTriggerWasDown_ = triggerDown;
       return;
     }
@@ -2896,10 +3515,12 @@ class QuestSdfApp {
     if (!rightHandManipulatingObject && triggerDown && frameCounter_ >= nextSculptFrame_) {
       if (!rightControllerToolStrokeActive_) {
         history_.capture();
+        beginSculptStroke(toolCenterLocal, toolInContact, contactLocal);
         rightControllerToolStrokeActive_ = true;
       }
-      applyActiveSculptTool(toolCenterLocal, localBrushRadius);
+      applySculptStamp(toolCenterLocal, localBrushRadius, brushStrength_);
       uploadSdfTexture();
+      uploadColorTexture();
       nextSculptFrame_ = frameCounter_ + (activeTool_ == VrTool::Smooth ? 3 : 2);
       if (frameCounter_ >= nextSculptLogFrame_) {
         logInfo("VR %s contact brush: trigger=%.2f, tool=(%.2f %.2f %.2f), scale=%.2f",
@@ -3179,6 +3800,69 @@ class QuestSdfApp {
     volume_.clearDirtyBounds();
   }
 
+  void uploadColorTexture() {
+    if (colorTexture_ == 0 || !colorDirtyBounds_.valid || colorVoxels_.empty()) {
+      return;
+    }
+
+    const large::sdf::IVec3 size = volume_.size();
+    const large::sdf::VoxelBounds bounds = clampVoxelBounds(colorDirtyBounds_, size);
+    const int width = bounds.max.x - bounds.min.x + 1;
+    const int height = bounds.max.y - bounds.min.y + 1;
+    const int depth = bounds.max.z - bounds.min.z + 1;
+    const int totalVoxels = size.x * size.y * size.z;
+    const int uploadVoxels = width * height * depth;
+    const bool uploadFull = uploadVoxels * 4 >= totalVoxels * 3;
+
+    glBindTexture(GL_TEXTURE_3D, colorTexture_);
+    glPixelStorei(GL_UNPACK_ALIGNMENT, 1);
+    if (uploadFull) {
+      glTexSubImage3D(GL_TEXTURE_3D,
+                      0,
+                      0,
+                      0,
+                      0,
+                      size.x,
+                      size.y,
+                      size.z,
+                      GL_RGBA,
+                      GL_UNSIGNED_BYTE,
+                      colorVoxels_.data());
+    } else {
+      colorUploadScratch_.resize(static_cast<std::size_t>(uploadVoxels) * 4);
+      const std::uint8_t* values = colorVoxels_.data();
+      std::uint8_t* packed = colorUploadScratch_.data();
+      for (int z = 0; z < depth; ++z) {
+        for (int y = 0; y < height; ++y) {
+          const std::size_t sourceIndex = volume_.index(bounds.min.x, bounds.min.y + y, bounds.min.z + z) * 4;
+          const std::size_t destinationIndex =
+              (static_cast<std::size_t>(z) * static_cast<std::size_t>(height) + static_cast<std::size_t>(y)) *
+              static_cast<std::size_t>(width) * 4;
+          std::copy_n(values + sourceIndex, static_cast<std::size_t>(width) * 4, packed + destinationIndex);
+        }
+      }
+
+      glTexSubImage3D(GL_TEXTURE_3D,
+                      0,
+                      bounds.min.x,
+                      bounds.min.y,
+                      bounds.min.z,
+                      width,
+                      height,
+                      depth,
+                      GL_RGBA,
+                      GL_UNSIGNED_BYTE,
+                      packed);
+    }
+    const GLenum uploadError = glGetError();
+    glBindTexture(GL_TEXTURE_3D, 0);
+    if (uploadError != GL_NO_ERROR) {
+      logError("Color texture sub upload failed: 0x%x, box=%dx%dx%d", uploadError, width, height, depth);
+      return;
+    }
+    colorDirtyBounds_ = {};
+  }
+
   bool initializeMeshRenderer() {
     const large::sdf::SurfaceMesh mesh = large::sdf::buildSurfaceMesh(volume_);
     std::vector<MeshVertex> vertices;
@@ -3329,6 +4013,7 @@ in vec2 vUv;
 out vec4 oColor;
 
 uniform sampler3D uSdf;
+uniform sampler3D uColorVol;
 uniform vec3 uCameraPos;
 uniform mat3 uViewRotation;
 uniform vec4 uFovTangents;
@@ -3340,167 +4025,9 @@ uniform vec3 uObjectPos;
 uniform mat3 uObjectRotation;
 uniform mat3 uObjectInvRotation;
 uniform float uObjectScale;
-uniform vec3 uBrushCenter;
-uniform float uBrushRadius;
-uniform float uBrushVisible;
-uniform float uTriggerValue;
-uniform int uToolIndex;
-uniform float uBrushStrength;
 uniform float uArEnabled;
-uniform float uMenuVisible;
-uniform vec3 uLeftUiPosition;
-uniform float uLeftUiVisible;
-uniform vec3 uRightToolPosition;
-uniform vec3 uRightToolDirection;
-uniform float uRightToolVisible;
-uniform int uMenuHoverIndex;
-uniform float uMenuPointerActive;
-uniform vec3 uMenuPointerStart;
-uniform vec3 uMenuPointerEnd;
-
-#if 0
-int toolChar(int tool, int index) {
-  if (tool == 0) {
-    if (index == 0) return 65;
-    if (index == 1) return 68;
-    if (index == 2) return 68;
-  } else if (tool == 1) {
-    if (index == 0) return 83;
-    if (index == 1) return 85;
-    if (index == 2) return 66;
-  } else if (tool == 2) {
-    if (index == 0) return 83;
-    if (index == 1) return 77;
-    if (index == 2) return 79;
-    if (index == 3) return 79;
-    if (index == 4) return 84;
-    if (index == 5) return 72;
-  } else {
-    if (index == 0) return 83;
-    if (index == 1) return 84;
-    if (index == 2) return 82;
-    if (index == 3) return 69;
-    if (index == 4) return 84;
-    if (index == 5) return 67;
-    if (index == 6) return 72;
-  }
-  return 0;
-}
-
-int sizeChar(int index) {
-  if (index == 0) return 83;
-  if (index == 1) return 73;
-  if (index == 2) return 90;
-  if (index == 3) return 69;
-  return 0;
-}
-
-int powerChar(int index) {
-  if (index == 0) return 80;
-  if (index == 1) return 79;
-  if (index == 2) return 87;
-  if (index == 3) return 69;
-  if (index == 4) return 82;
-  return 0;
-}
-
-int menuChar(int item, int index) {
-  if (item == 0) {
-    if (index == 0) return 83;
-    if (index == 1) return 65;
-    if (index == 2) return 86;
-    if (index == 3) return 69;
-  } else if (item == 1) {
-    if (index == 0) return 76;
-    if (index == 1) return 79;
-    if (index == 2) return 65;
-    if (index == 3) return 68;
-  } else if (item == 2) {
-    if (index == 0) return 69;
-    if (index == 1) return 88;
-    if (index == 2) return 80;
-    if (index == 3) return 79;
-    if (index == 4) return 82;
-    if (index == 5) return 84;
-  } else if (item == 3) {
-    if (index == 0) return 81;
-    if (index == 1) return 85;
-    if (index == 2) return 73;
-    if (index == 3) return 84;
-  }
-  return 0;
-}
-
-int glyphRow(int code, int row) {
-  if (code == 65) { if (row == 0) return 14; if (row == 1) return 17; if (row == 2) return 17; if (row == 3) return 31; if (row == 4) return 17; if (row == 5) return 17; if (row == 6) return 17; }
-  if (code == 66) { if (row == 0) return 30; if (row == 1) return 17; if (row == 2) return 17; if (row == 3) return 30; if (row == 4) return 17; if (row == 5) return 17; if (row == 6) return 30; }
-  if (code == 67) { if (row == 0) return 14; if (row == 1) return 17; if (row == 2) return 16; if (row == 3) return 16; if (row == 4) return 16; if (row == 5) return 17; if (row == 6) return 14; }
-  if (code == 68) { if (row == 0) return 30; if (row == 1) return 17; if (row == 2) return 17; if (row == 3) return 17; if (row == 4) return 17; if (row == 5) return 17; if (row == 6) return 30; }
-  if (code == 69) { if (row == 0) return 31; if (row == 1) return 16; if (row == 2) return 16; if (row == 3) return 30; if (row == 4) return 16; if (row == 5) return 16; if (row == 6) return 31; }
-  if (code == 72) { if (row == 0) return 17; if (row == 1) return 17; if (row == 2) return 17; if (row == 3) return 31; if (row == 4) return 17; if (row == 5) return 17; if (row == 6) return 17; }
-  if (code == 73) { if (row == 0) return 14; if (row == 1) return 4; if (row == 2) return 4; if (row == 3) return 4; if (row == 4) return 4; if (row == 5) return 4; if (row == 6) return 14; }
-  if (code == 76) { if (row == 0) return 16; if (row == 1) return 16; if (row == 2) return 16; if (row == 3) return 16; if (row == 4) return 16; if (row == 5) return 16; if (row == 6) return 31; }
-  if (code == 77) { if (row == 0) return 17; if (row == 1) return 27; if (row == 2) return 21; if (row == 3) return 21; if (row == 4) return 17; if (row == 5) return 17; if (row == 6) return 17; }
-  if (code == 78) { if (row == 0) return 17; if (row == 1) return 25; if (row == 2) return 21; if (row == 3) return 19; if (row == 4) return 17; if (row == 5) return 17; if (row == 6) return 17; }
-  if (code == 79) { if (row == 0) return 14; if (row == 1) return 17; if (row == 2) return 17; if (row == 3) return 17; if (row == 4) return 17; if (row == 5) return 17; if (row == 6) return 14; }
-  if (code == 80) { if (row == 0) return 30; if (row == 1) return 17; if (row == 2) return 17; if (row == 3) return 30; if (row == 4) return 16; if (row == 5) return 16; if (row == 6) return 16; }
-  if (code == 81) { if (row == 0) return 14; if (row == 1) return 17; if (row == 2) return 17; if (row == 3) return 17; if (row == 4) return 21; if (row == 5) return 18; if (row == 6) return 13; }
-  if (code == 82) { if (row == 0) return 30; if (row == 1) return 17; if (row == 2) return 17; if (row == 3) return 30; if (row == 4) return 20; if (row == 5) return 18; if (row == 6) return 17; }
-  if (code == 83) { if (row == 0) return 15; if (row == 1) return 16; if (row == 2) return 16; if (row == 3) return 14; if (row == 4) return 1; if (row == 5) return 1; if (row == 6) return 30; }
-  if (code == 84) { if (row == 0) return 31; if (row == 1) return 4; if (row == 2) return 4; if (row == 3) return 4; if (row == 4) return 4; if (row == 5) return 4; if (row == 6) return 4; }
-  if (code == 85) { if (row == 0) return 17; if (row == 1) return 17; if (row == 2) return 17; if (row == 3) return 17; if (row == 4) return 17; if (row == 5) return 17; if (row == 6) return 14; }
-  if (code == 86) { if (row == 0) return 17; if (row == 1) return 17; if (row == 2) return 17; if (row == 3) return 17; if (row == 4) return 10; if (row == 5) return 10; if (row == 6) return 4; }
-  if (code == 87) { if (row == 0) return 17; if (row == 1) return 17; if (row == 2) return 17; if (row == 3) return 21; if (row == 4) return 21; if (row == 5) return 27; if (row == 6) return 17; }
-  if (code == 88) { if (row == 0) return 17; if (row == 1) return 17; if (row == 2) return 10; if (row == 3) return 4; if (row == 4) return 10; if (row == 5) return 17; if (row == 6) return 17; }
-  if (code == 90) { if (row == 0) return 31; if (row == 1) return 1; if (row == 2) return 2; if (row == 3) return 4; if (row == 4) return 8; if (row == 5) return 16; if (row == 6) return 31; }
-  return 0;
-}
-
-float glyphAlpha(int code, vec2 origin, vec2 frag, float scale) {
-  if (code == 0) {
-    return 0.0;
-  }
-  vec2 rel = (frag - origin) / scale;
-  ivec2 cell = ivec2(floor(rel));
-  if (cell.x < 0 || cell.x >= 5 || cell.y < 0 || cell.y >= 7) {
-    return 0.0;
-  }
-  int bits = glyphRow(code, cell.y);
-  int mask = 1 << (4 - cell.x);
-  return ((bits & mask) != 0) ? 1.0 : 0.0;
-}
-
-float drawToolName(vec2 frag) {
-  float a = 0.0;
-  for (int i = 0; i < 7; ++i) {
-    a = max(a, glyphAlpha(toolChar(uToolIndex, i), vec2(26.0 + float(i) * 18.0, 24.0), frag, 3.0));
-  }
-  return a;
-}
-
-float drawLabel(vec2 frag, int label, vec2 origin) {
-  float a = 0.0;
-  for (int i = 0; i < 5; ++i) {
-    int code = label == 0 ? sizeChar(i) : powerChar(i);
-    a = max(a, glyphAlpha(code, origin + vec2(float(i) * 12.0, 0.0), frag, 2.0));
-  }
-  return a;
-}
-
-float drawMenuItem(vec2 frag, int item, vec2 origin) {
-  float a = 0.0;
-  for (int i = 0; i < 6; ++i) {
-    a = max(a, glyphAlpha(menuChar(item, i), origin + vec2(float(i) * 12.0, 0.0), frag, 2.0));
-  }
-  return a;
-}
-
-float rectMask(vec2 frag, vec2 minP, vec2 maxP) {
-  vec2 a = step(minP, frag);
-  vec2 b = step(frag, maxP);
-  return a.x * a.y * b.x * b.y;
-}
-#endif
+uniform vec3 uWorldOffset;  // user locomotion offset applied to the static room
+uniform float uVoxelSize;   // local size of one SDF voxel
 
 vec2 intersectBox(vec3 rayOrigin, vec3 rayDir, vec3 boxMin, vec3 boxMax) {
   vec3 invDir = 1.0 / rayDir;
@@ -3550,7 +4077,7 @@ void accumulateBoundsEdge(inout float edgeAlpha,
   edgeAlpha = max(edgeAlpha, visible * clamp(core * 0.74 + halo * 0.20, 0.0, 0.86));
 }
 
-vec3 applyVolumeBoundsCube(vec3 color, vec2 uv, float sceneDepth) {
+vec3 applyVolumeBoundsCube(vec3 color, vec2 uv, float sceneDepth, inout float sceneAlpha) {
   float x = mix(uFovTangents.x, uFovTangents.y, uv.x);
   float y = mix(uFovTangents.z, uFovTangents.w, uv.y);
   vec3 rayDir = normalize(uViewRotation * normalize(vec3(x, y, -1.0)));
@@ -3582,24 +4109,34 @@ vec3 applyVolumeBoundsCube(vec3 color, vec2 uv, float sceneDepth) {
   }
 
   vec3 boundsColor = vec3(0.58, 0.82, 0.92);
+  sceneAlpha = max(sceneAlpha, edgeAlpha);
   return mix(color, boundsColor, edgeAlpha);
 }
 
 float sampleSdfLocal(vec3 localPoint) {
   vec3 uv = (localPoint - uVolumeMin) / uVolumeExtent;
-  return texture(uSdf, clamp(uv, vec3(0.0), vec3(1.0))).r;
+  float field = texture(uSdf, clamp(uv, vec3(0.0), vec3(1.0))).r;
+  // Intersect the field with the workspace box so material reaching the
+  // volume limits is capped by a flat face instead of appearing open.
+  vec3 boxCenter = uVolumeMin + uVolumeExtent * 0.5;
+  vec3 boxHalf = uVolumeExtent * 0.5 - vec3(uVoxelSize * 0.5);
+  vec3 q = abs(localPoint - boxCenter) - boxHalf;
+  float boxDistance = length(max(q, vec3(0.0))) + min(max(q.x, max(q.y, q.z)), 0.0);
+  return max(field, boxDistance);
 }
 
-vec3 estimateNormal(vec3 localPoint) {
-  float e = max(0.006, 0.012 / max(uObjectScale, 0.001));
+vec3 estimateNormalLocal(vec3 localPoint) {
+  // Sample at ~one voxel so the central differences straddle several
+  // trilinear cells; sub-voxel offsets give per-cell constant gradients,
+  // which shows up as triangular facets on the surface.
+  float e = max(uVoxelSize * 0.75, 0.004);
   vec3 dx = vec3(e, 0.0, 0.0);
   vec3 dy = vec3(0.0, e, 0.0);
   vec3 dz = vec3(0.0, 0.0, e);
-  vec3 normalLocal = normalize(vec3(
+  return normalize(vec3(
     sampleSdfLocal(localPoint + dx) - sampleSdfLocal(localPoint - dx),
     sampleSdfLocal(localPoint + dy) - sampleSdfLocal(localPoint - dy),
     sampleSdfLocal(localPoint + dz) - sampleSdfLocal(localPoint - dz)));
-  return normalize(uObjectRotation * normalLocal);
 }
 
 float roomLine(float value, float spacing, float width) {
@@ -3708,7 +4245,9 @@ vec3 shadeRoom(vec3 rayOrigin, vec3 rayDir, out float roomDepth) {
 
 vec3 shadeUv(vec2 uv, out float sceneDepth, out float sceneAlpha) {
   sceneDepth = 10000.0;
-  sceneAlpha = 1.0 - clamp(uArEnabled, 0.0, 1.0) * 0.0;
+  // In AR mode the synthetic room is fully transparent so the passthrough
+  // layer underneath shows through; the sculpture stays opaque.
+  sceneAlpha = 1.0 - clamp(uArEnabled, 0.0, 1.0);
   float x = mix(uFovTangents.x, uFovTangents.y, uv.x);
   float y = mix(uFovTangents.z, uFovTangents.w, uv.y);
   vec3 rayDir = normalize(uViewRotation * normalize(vec3(x, y, -1.0)));
@@ -3722,7 +4261,10 @@ vec3 shadeUv(vec2 uv, out float sceneDepth, out float sceneAlpha) {
   vec2 hit = intersectBox(rayOriginLocal, rayDirLocal, renderBoxMin, renderBoxMax);
 
   if (hit.y <= max(hit.x, 0.0)) {
-    vec3 background = shadeRoom(rayOrigin, rayDir, roomDepth);
+    if (uArEnabled > 0.5) {
+      return vec3(0.0);
+    }
+    vec3 background = shadeRoom(rayOrigin + uWorldOffset, rayDir, roomDepth);
     sceneDepth = roomDepth;
     return background;
   }
@@ -3778,212 +4320,36 @@ vec3 shadeUv(vec2 uv, out float sceneDepth, out float sceneAlpha) {
   }
 
   if (!found) {
-    vec3 background = shadeRoom(rayOrigin, rayDir, roomDepth);
+    if (uArEnabled > 0.5) {
+      return vec3(0.0);
+    }
+    vec3 background = shadeRoom(rayOrigin + uWorldOffset, rayDir, roomDepth);
     sceneDepth = roomDepth;
     return background;
   }
 
   sceneAlpha = 1.0;
   sceneDepth = max(t * uObjectScale, 0.0);
-  vec3 normal = estimateNormal(localP);
+  vec3 normalLocal = estimateNormalLocal(localP);
+  vec3 normal = normalize(uObjectRotation * normalLocal);
   vec3 light = normalize(vec3(-0.35, 0.85, 0.42));
   float diffuse = max(dot(normal, light), 0.0);
   float wrap = 0.5 + 0.5 * dot(normal, light);
-  vec3 clay = vec3(0.86, 0.68, 0.54);
-  vec3 color = clay * (0.35 + diffuse * 0.55 + wrap * 0.10);
-  float brushKeepAlive = uBrushVisible * 0.00000001 + uBrushRadius * 0.00000001 +
-                         uTriggerValue * 0.00000001 + uBrushStrength * 0.00000001 +
-                         float(uToolIndex) * 0.00000001 + dot(uBrushCenter, vec3(0.00000001));
-  color += vec3(brushKeepAlive);
+  // Sample the paint slightly inside the surface so the trilinear filter
+  // does not dilute it with unpainted voxels just outside.
+  vec3 colorPoint = localP - normalLocal * (uVoxelSize * 0.6);
+  vec3 uvw = clamp((colorPoint - uVolumeMin) / uVolumeExtent, vec3(0.0), vec3(1.0));
+  vec3 albedo = texture(uColorVol, uvw).rgb;
+  vec3 color = albedo * (0.35 + diffuse * 0.55 + wrap * 0.10);
   return color;
 }
 
-#if 0
-vec3 brushUiColor() {
-  vec3 idleColor = vec3(0.25, 0.85, 1.0);
-  vec3 activeColor = vec3(1.0, 0.60, 0.24);
-  if (uToolIndex == 1) {
-    idleColor = vec3(1.0, 0.35, 0.36);
-    activeColor = vec3(1.0, 0.12, 0.18);
-  } else if (uToolIndex == 2) {
-    idleColor = vec3(0.40, 1.0, 0.62);
-    activeColor = vec3(0.18, 0.95, 0.36);
-  } else if (uToolIndex == 3) {
-    idleColor = vec3(0.72, 0.48, 1.0);
-    activeColor = vec3(0.95, 0.30, 1.0);
-  }
-  return mix(idleColor, activeColor, smoothstep(0.50, 0.80, uTriggerValue));
-}
-
-vec3 applyHudAtFrag(vec3 color, vec2 frag) {
-  float panel = rectMask(frag, vec2(16.0, 16.0), vec2(248.0, 112.0));
-  color = mix(color, vec3(0.018, 0.022, 0.026), panel * 0.74);
-
-  float toolText = drawToolName(frag);
-  color = mix(color, vec3(0.92, 0.95, 0.98), toolText);
-
-  float sizeLabel = drawLabel(frag, 0, vec2(28.0, 62.0));
-  float powerLabel = drawLabel(frag, 1, vec2(116.0, 62.0));
-  color = mix(color, vec3(0.72, 0.78, 0.84), max(sizeLabel, powerLabel));
-
-  float sizeBack = rectMask(frag, vec2(86.0, 56.0), vec2(98.0, 104.0));
-  float powerBack = rectMask(frag, vec2(116.0, 88.0), vec2(226.0, 98.0));
-  color = mix(color, vec3(0.08, 0.10, 0.12), max(sizeBack, powerBack));
-
-  float sizeNorm = clamp((uBrushRadius - 0.015) / (0.60 - 0.015), 0.0, 1.0);
-  float powerNorm = clamp(uBrushStrength, 0.0, 1.0);
-  float sizeTop = mix(104.0, 56.0, sizeNorm);
-  float sizeFill = rectMask(frag, vec2(86.0, sizeTop), vec2(98.0, 104.0));
-  float powerFill = rectMask(frag, vec2(116.0, 88.0), vec2(116.0 + 110.0 * powerNorm, 98.0));
-  color = mix(color, vec3(0.25, 0.85, 1.0), sizeFill);
-  color = mix(color, vec3(1.0, 0.60, 0.24), powerFill);
-
-  float menuOn = step(0.5, uMenuVisible);
-  float menuPanel = rectMask(frag, vec2(16.0, 128.0), vec2(248.0, 264.0)) * menuOn;
-  color = mix(color, vec3(0.016, 0.019, 0.023), menuPanel * 0.86);
-  float row0 = rectMask(frag, vec2(28.0, 144.0), vec2(226.0, 168.0));
-  float row1 = rectMask(frag, vec2(28.0, 174.0), vec2(226.0, 198.0));
-  float row2 = rectMask(frag, vec2(28.0, 204.0), vec2(226.0, 228.0));
-  float row3 = rectMask(frag, vec2(28.0, 234.0), vec2(226.0, 258.0));
-  float menuRows = max(max(row0, row1), max(row2, row3));
-  color = mix(color, vec3(0.08, 0.10, 0.12), menuRows * menuOn * 0.72);
-  float hoveredRow = 0.0;
-  hoveredRow = max(hoveredRow, row0 * (uMenuHoverIndex == 0 ? 1.0 : 0.0));
-  hoveredRow = max(hoveredRow, row1 * (uMenuHoverIndex == 1 ? 1.0 : 0.0));
-  hoveredRow = max(hoveredRow, row2 * (uMenuHoverIndex == 2 ? 1.0 : 0.0));
-  hoveredRow = max(hoveredRow, row3 * (uMenuHoverIndex == 3 ? 1.0 : 0.0));
-  color = mix(color, vec3(0.30, 0.42, 0.48), hoveredRow * menuOn * 0.88);
-  float menuText = 0.0;
-  menuText = max(menuText, drawMenuItem(frag, 0, vec2(46.0, 149.0)));
-  menuText = max(menuText, drawMenuItem(frag, 1, vec2(46.0, 179.0)));
-  menuText = max(menuText, drawMenuItem(frag, 2, vec2(46.0, 209.0)));
-  menuText = max(menuText, drawMenuItem(frag, 3, vec2(46.0, 239.0)));
-  color = mix(color, vec3(0.90, 0.94, 0.98), menuText * menuOn);
-  return color;
-}
-
-float rayPointDistance(vec3 rayOrigin, vec3 rayDir, vec3 point, out float rayT) {
-  rayT = max(dot(point - rayOrigin, rayDir), 0.0);
-  return length(rayOrigin + rayDir * rayT - point);
-}
-
-float raySegmentDistance(vec3 rayOrigin, vec3 rayDir, vec3 a, vec3 b, out float rayT) {
-  vec3 segment = b - a;
-  float segLen2 = max(dot(segment, segment), 0.00001);
-  float raySeg = dot(rayDir, segment);
-  vec3 originToA = rayOrigin - a;
-  float originRay = dot(originToA, rayDir);
-  float originSeg = dot(originToA, segment);
-  float denom = max(segLen2 - raySeg * raySeg, 0.00001);
-  float unclampedT = (raySeg * originSeg - originRay * segLen2) / denom;
-  float segT = clamp((originSeg + raySeg * unclampedT) / segLen2, 0.0, 1.0);
-  vec3 pointOnSegment = a + segment * segT;
-  rayT = max(dot(pointOnSegment - rayOrigin, rayDir), 0.0);
-  return length(rayOrigin + rayDir * rayT - pointOnSegment);
-}
-
-vec3 applyMenuPointerLine(vec3 color, vec3 rayOrigin, vec3 rayDir, float sceneDepth) {
-  if (uMenuPointerActive < 0.5) {
-    return color;
-  }
-  float pointerT = 0.0;
-  float distance = raySegmentDistance(rayOrigin, rayDir, uMenuPointerStart, uMenuPointerEnd, pointerT);
-  if (pointerT > sceneDepth - 0.01) {
-    return color;
-  }
-  float core = 1.0 - smoothstep(0.006, 0.014, distance);
-  float glow = 1.0 - smoothstep(0.014, 0.035, distance);
-  vec3 pointerColor = mix(vec3(0.65, 0.88, 1.0), brushUiColor(), 0.35);
-  color = mix(color, pointerColor, clamp(core * 0.95 + glow * 0.32, 0.0, 0.95));
-  return color;
-}
-
-vec3 applyLeftHandUi(vec3 color, vec3 rayOrigin, vec3 rayDir, float sceneDepth) {
-  if (uLeftUiVisible < 0.5) {
-    return color;
-  }
-
-  vec3 center = uLeftUiPosition;
-  vec3 panelForward = normalize(rayOrigin - center);
-  vec3 panelRight = cross(vec3(0.0, 1.0, 0.0), panelForward);
-  if (dot(panelRight, panelRight) < 0.05) {
-    panelRight = vec3(1.0, 0.0, 0.0);
-  } else {
-    panelRight = normalize(panelRight);
-  }
-  vec3 panelUp = normalize(cross(panelForward, panelRight));
-  float denom = dot(rayDir, panelForward);
-  if (abs(denom) < 0.001) {
-    return color;
-  }
-
-  float t = dot(center - rayOrigin, panelForward) / denom;
-  if (t <= 0.0) {
-    return color;
-  }
-  if (t > sceneDepth - 0.01) {
-    return color;
-  }
-
-  vec3 hit = rayOrigin + rayDir * t;
-  vec2 local = vec2(dot(hit - center, panelRight), dot(hit - center, panelUp));
-  float contentWidth = 264.0;
-  float contentHeight = mix(128.0, 280.0, step(0.5, uMenuVisible));
-  float panelWidth = 0.34;
-  float panelHeight = panelWidth * contentHeight / contentWidth;
-  if (abs(local.x) > panelWidth * 0.5 || abs(local.y) > panelHeight * 0.5) {
-    return color;
-  }
-
-  vec2 frag = vec2((local.x / panelWidth + 0.5) * contentWidth,
-                   (0.5 - local.y / panelHeight) * contentHeight);
-  return applyHudAtFrag(color, frag);
-}
-
-vec3 applyRightHandTool(vec3 color, vec3 rayOrigin, vec3 rayDir, float sceneDepth) {
-  if (uRightToolVisible < 0.5 || uMenuPointerActive > 0.5) {
-    return color;
-  }
-
-  vec3 toolDir = normalize(uRightToolDirection);
-  vec3 base = uRightToolPosition + toolDir * 0.015;
-  vec3 tip = uRightToolPosition + toolDir * 0.20;
-  vec3 toolColor = brushUiColor();
-
-  float shaftT = 0.0;
-  float shaftDistance = raySegmentDistance(rayOrigin, rayDir, base, tip, shaftT);
-  float shaftVisible = step(0.0, shaftT) * step(shaftT, sceneDepth - 0.01);
-  float shaft = (1.0 - smoothstep(0.010, 0.022, shaftDistance)) * shaftVisible;
-
-  float headT = 0.0;
-  float headDistance = rayPointDistance(rayOrigin, rayDir, tip, headT);
-  float headRadius = clamp(0.018 + uBrushRadius * 0.12, 0.026, 0.085);
-  float headVisible = step(0.0, headT) * step(headT, sceneDepth - 0.01);
-  float head = (1.0 - smoothstep(headRadius, headRadius * 1.55, headDistance)) * headVisible;
-  float ring = (1.0 - smoothstep(0.004, 0.014, abs(headDistance - headRadius))) * headVisible;
-
-  color = mix(color, vec3(0.74, 0.80, 0.86), shaft * 0.75);
-  color = mix(color, toolColor, clamp(head * 0.70 + ring * 0.90, 0.0, 0.95));
-  return color;
-}
-
-vec3 applySpatialInterface(vec3 color, vec2 uv, float sceneDepth) {
-  float x = mix(uFovTangents.x, uFovTangents.y, uv.x);
-  float y = mix(uFovTangents.z, uFovTangents.w, uv.y);
-  vec3 rayDir = normalize(uViewRotation * normalize(vec3(x, y, -1.0)));
-  vec3 rayOrigin = uCameraPos;
-  color = applyMenuPointerLine(color, rayOrigin, rayDir, sceneDepth);
-  color = applyLeftHandUi(color, rayOrigin, rayDir, sceneDepth);
-  color = applyRightHandTool(color, rayOrigin, rayDir, sceneDepth);
-  return color;
-}
-#endif
 
 void main() {
   float sceneDepth = 10000.0;
   float sceneAlpha = 1.0;
   vec3 color = shadeUv(vUv, sceneDepth, sceneAlpha);
-  color = applyVolumeBoundsCube(color, vUv, sceneDepth);
+  color = applyVolumeBoundsCube(color, vUv, sceneDepth, sceneAlpha);
   oColor = vec4(color, sceneAlpha);
 }
 )";
@@ -4004,31 +4370,17 @@ void main() {
     sdfObjectRotationLocation_ = glGetUniformLocation(sdfProgram_, "uObjectRotation");
     sdfObjectInvRotationLocation_ = glGetUniformLocation(sdfProgram_, "uObjectInvRotation");
     sdfObjectScaleLocation_ = glGetUniformLocation(sdfProgram_, "uObjectScale");
-    sdfBrushCenterLocation_ = glGetUniformLocation(sdfProgram_, "uBrushCenter");
-    sdfBrushRadiusLocation_ = glGetUniformLocation(sdfProgram_, "uBrushRadius");
-    sdfBrushVisibleLocation_ = glGetUniformLocation(sdfProgram_, "uBrushVisible");
-    sdfTriggerValueLocation_ = glGetUniformLocation(sdfProgram_, "uTriggerValue");
-    sdfToolIndexLocation_ = glGetUniformLocation(sdfProgram_, "uToolIndex");
-    sdfBrushStrengthLocation_ = glGetUniformLocation(sdfProgram_, "uBrushStrength");
     sdfArEnabledLocation_ = glGetUniformLocation(sdfProgram_, "uArEnabled");
-    sdfMenuVisibleLocation_ = glGetUniformLocation(sdfProgram_, "uMenuVisible");
-    sdfLeftUiPositionLocation_ = glGetUniformLocation(sdfProgram_, "uLeftUiPosition");
-    sdfLeftUiVisibleLocation_ = glGetUniformLocation(sdfProgram_, "uLeftUiVisible");
-    sdfRightToolPositionLocation_ = glGetUniformLocation(sdfProgram_, "uRightToolPosition");
-    sdfRightToolDirectionLocation_ = glGetUniformLocation(sdfProgram_, "uRightToolDirection");
-    sdfRightToolVisibleLocation_ = glGetUniformLocation(sdfProgram_, "uRightToolVisible");
-    sdfMenuHoverIndexLocation_ = glGetUniformLocation(sdfProgram_, "uMenuHoverIndex");
-    sdfMenuPointerActiveLocation_ = glGetUniformLocation(sdfProgram_, "uMenuPointerActive");
-    sdfMenuPointerStartLocation_ = glGetUniformLocation(sdfProgram_, "uMenuPointerStart");
-    sdfMenuPointerEndLocation_ = glGetUniformLocation(sdfProgram_, "uMenuPointerEnd");
+    sdfWorldOffsetLocation_ = glGetUniformLocation(sdfProgram_, "uWorldOffset");
+    sdfVoxelSizeLocation_ = glGetUniformLocation(sdfProgram_, "uVoxelSize");
     const GLint samplerLocation = glGetUniformLocation(sdfProgram_, "uSdf");
+    const GLint colorSamplerLocation = glGetUniformLocation(sdfProgram_, "uColorVol");
     if (sdfCameraLocation_ < 0 || sdfViewRotationLocation_ < 0 || sdfFovTangentsLocation_ < 0 ||
         sdfVolumeMinLocation_ < 0 || sdfVolumeExtentLocation_ < 0 || sdfObjectPosLocation_ < 0 ||
         sdfRenderMinLocation_ < 0 || sdfRenderExtentLocation_ < 0 ||
         sdfObjectRotationLocation_ < 0 || sdfObjectInvRotationLocation_ < 0 || sdfObjectScaleLocation_ < 0 ||
-        sdfBrushCenterLocation_ < 0 || sdfBrushRadiusLocation_ < 0 || sdfBrushVisibleLocation_ < 0 ||
-        sdfTriggerValueLocation_ < 0 || sdfToolIndexLocation_ < 0 || sdfArEnabledLocation_ < 0 ||
-        samplerLocation < 0) {
+        sdfArEnabledLocation_ < 0 || sdfWorldOffsetLocation_ < 0 || sdfVoxelSizeLocation_ < 0 ||
+        samplerLocation < 0 || colorSamplerLocation < 0) {
       logError("SDF raymarch shader uniforms are missing");
       return false;
     }
@@ -4062,12 +4414,41 @@ void main() {
     volume_.clearDirtyBounds();
     recomputeSdfRenderBounds("initial");
 
+    initializeColorVoxels();
+    glGenTextures(1, &colorTexture_);
+    glBindTexture(GL_TEXTURE_3D, colorTexture_);
+    glTexParameteri(GL_TEXTURE_3D, GL_TEXTURE_MIN_FILTER, GL_LINEAR);
+    glTexParameteri(GL_TEXTURE_3D, GL_TEXTURE_MAG_FILTER, GL_LINEAR);
+    glTexParameteri(GL_TEXTURE_3D, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE);
+    glTexParameteri(GL_TEXTURE_3D, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE);
+    glTexParameteri(GL_TEXTURE_3D, GL_TEXTURE_WRAP_R, GL_CLAMP_TO_EDGE);
+    glPixelStorei(GL_UNPACK_ALIGNMENT, 1);
+    glTexImage3D(GL_TEXTURE_3D,
+                 0,
+                 GL_RGBA8,
+                 size.x,
+                 size.y,
+                 size.z,
+                 0,
+                 GL_RGBA,
+                 GL_UNSIGNED_BYTE,
+                 colorVoxels_.data());
+    glBindTexture(GL_TEXTURE_3D, 0);
+
+    const GLenum colorTextureError = glGetError();
+    if (colorTextureError != GL_NO_ERROR) {
+      logError("Color 3D texture upload failed: 0x%x", colorTextureError);
+      return false;
+    }
+    colorDirtyBounds_ = {};
+
     glGenVertexArrays(1, &sdfVao_);
     glUseProgram(sdfProgram_);
     glUniform1i(samplerLocation, 0);
+    glUniform1i(colorSamplerLocation, 1);
     glUseProgram(0);
 
-    logInfo("SDF raymarch renderer ready: %dx%dx%d texture", size.x, size.y, size.z);
+    logInfo("SDF raymarch renderer ready: %dx%dx%d texture + color volume", size.x, size.y, size.z);
     return true;
   }
 
@@ -4113,32 +4494,21 @@ void main() {
     glUniformMatrix3fv(sdfObjectRotationLocation_, 1, GL_FALSE, objectRotationMatrix.data());
     glUniformMatrix3fv(sdfObjectInvRotationLocation_, 1, GL_FALSE, objectInvRotationMatrix.data());
     glUniform1f(sdfObjectScaleLocation_, objectScale_);
-    glUniform3f(sdfBrushCenterLocation_, brushHitWorld_.x, brushHitWorld_.y, brushHitWorld_.z);
-    glUniform1f(sdfBrushRadiusLocation_, brushRadius_);
-    glUniform1f(sdfBrushVisibleLocation_, brushVisible_ ? 1.0f : 0.0f);
-    glUniform1f(sdfTriggerValueLocation_, rightTriggerValue_);
-    glUniform1i(sdfToolIndexLocation_, displayToolIndex());
-    glUniform1f(sdfBrushStrengthLocation_, brushStrength_);
-    glUniform1f(sdfArEnabledLocation_, arModeEnabled_ ? 1.0f : 0.0f);
-    glUniform1f(sdfMenuVisibleLocation_, menuVisible_ ? 1.0f : 0.0f);
-    const bool leftUiVisible = leftGripPose_.active;
-    const large::sdf::Vec3 uiPosition = leftUiPosition();
-    glUniform3f(sdfLeftUiPositionLocation_, uiPosition.x, uiPosition.y, uiPosition.z);
-    glUniform1f(sdfLeftUiVisibleLocation_, leftUiVisible ? 1.0f : 0.0f);
-    glUniform3f(sdfRightToolPositionLocation_, rightToolPosition_.x, rightToolPosition_.y, rightToolPosition_.z);
-    glUniform3f(sdfRightToolDirectionLocation_, rightToolDirection_.x, rightToolDirection_.y, rightToolDirection_.z);
-    glUniform1f(sdfRightToolVisibleLocation_, rightToolVisible_ ? 1.0f : 0.0f);
-    glUniform1i(sdfMenuHoverIndexLocation_, menuHoverIndex_);
-    glUniform1f(sdfMenuPointerActiveLocation_, menuPointerActive_ ? 1.0f : 0.0f);
-    glUniform3f(sdfMenuPointerStartLocation_, menuPointerStart_.x, menuPointerStart_.y, menuPointerStart_.z);
-    glUniform3f(sdfMenuPointerEndLocation_, menuPointerEnd_.x, menuPointerEnd_.y, menuPointerEnd_.z);
+    glUniform1f(sdfArEnabledLocation_, arModeEnabled_ && passthroughReady_ ? 1.0f : 0.0f);
+    glUniform3f(sdfWorldOffsetLocation_, worldOffset_.x, worldOffset_.y, worldOffset_.z);
+    glUniform1f(sdfVoxelSizeLocation_, volume_.voxelSize());
 
+    glActiveTexture(GL_TEXTURE1);
+    glBindTexture(GL_TEXTURE_3D, colorTexture_);
     glActiveTexture(GL_TEXTURE0);
     glBindTexture(GL_TEXTURE_3D, sdfTexture_);
     glBindVertexArray(sdfVao_);
     glDrawArrays(GL_TRIANGLES, 0, 3);
     glBindVertexArray(0);
     glBindTexture(GL_TEXTURE_3D, 0);
+    glActiveTexture(GL_TEXTURE1);
+    glBindTexture(GL_TEXTURE_3D, 0);
+    glActiveTexture(GL_TEXTURE0);
     glUseProgram(0);
   }
 
@@ -4170,18 +4540,13 @@ uniform vec3 uCameraPos;
 uniform mat3 uViewRotation;
 uniform vec4 uFovTangents;
 uniform float uBrushRadius;
-uniform float uBrushStrength;
 uniform float uTriggerValue;
 uniform int uToolIndex;
-uniform float uArEnabled;
-uniform float uArAvailable;
-uniform float uMenuVisible;
 uniform vec3 uLeftUiPosition;
 uniform float uLeftUiVisible;
 uniform vec3 uRightToolPosition;
 uniform vec3 uRightToolDirection;
 uniform float uRightToolVisible;
-uniform int uMenuHoverIndex;
 uniform float uMenuPointerActive;
 uniform vec3 uMenuPointerStart;
 uniform vec3 uMenuPointerEnd;
@@ -4189,6 +4554,19 @@ uniform float uLeftHandVisible;
 uniform float uRightHandVisible;
 uniform vec3 uLeftHandJoints[26];
 uniform vec3 uRightHandJoints[26];
+uniform sampler2D uHud;
+uniform vec2 uHudVisibleSize;  // panel pixels currently shown (header or full menu)
+uniform vec2 uHudFullSize;     // full HUD texture size in pixels
+uniform float uPanelWidth;     // panel width in meters
+uniform vec3 uPaintColor;
+uniform vec3 uFlattenPlaneCenter;
+uniform vec3 uFlattenPlaneNormal;
+uniform float uFlattenPlaneRadius;
+uniform float uFlattenPlaneVisible;
+uniform vec3 uMirrorPlaneCenter;
+uniform vec3 uMirrorPlaneNormal;
+uniform float uMirrorPlaneRadius;
+uniform float uMirrorPlaneVisible;
 
 void paint(inout vec3 color, inout float alpha, vec3 source, float sourceAlpha) {
   float a = clamp(sourceAlpha, 0.0, 1.0);
@@ -4197,22 +4575,6 @@ void paint(inout vec3 color, inout float alpha, vec3 source, float sourceAlpha) 
     color = (color * alpha * (1.0 - a) + source * a) / outAlpha;
   }
   alpha = outAlpha;
-}
-
-vec3 brushUiColor() {
-  vec3 idleColor = vec3(0.25, 0.85, 1.0);
-  vec3 activeColor = vec3(1.0, 0.60, 0.24);
-  if (uToolIndex == 1) {
-    idleColor = vec3(1.0, 0.35, 0.36);
-    activeColor = vec3(1.0, 0.12, 0.18);
-  } else if (uToolIndex == 2) {
-    idleColor = vec3(0.40, 1.0, 0.62);
-    activeColor = vec3(0.18, 0.95, 0.36);
-  } else if (uToolIndex == 3) {
-    idleColor = vec3(0.72, 0.48, 1.0);
-    activeColor = vec3(0.95, 0.30, 1.0);
-  }
-  return mix(idleColor, activeColor, smoothstep(0.50, 0.80, uTriggerValue));
 }
 
 vec3 toolPalette(int index) {
@@ -4225,68 +4587,25 @@ vec3 toolPalette(int index) {
   if (index == 3) {
     return vec3(0.82, 0.44, 1.0);
   }
+  if (index == 4) {
+    return vec3(1.0, 0.85, 0.25);
+  }
+  if (index == 5) {
+    return vec3(1.0, 0.55, 0.20);
+  }
+  if (index == 6) {
+    return vec3(0.55, 0.78, 0.95);
+  }
+  if (index == 7) {
+    return uPaintColor;
+  }
   return vec3(0.25, 0.85, 1.0);
 }
 
-float rectMask(vec2 frag, vec2 minP, vec2 maxP) {
-  vec2 a = step(minP, frag);
-  vec2 b = step(frag, maxP);
-  return a.x * a.y * b.x * b.y;
-}
-
-float rectEdge(vec2 frag, vec2 minP, vec2 maxP, float width) {
-  float outer = rectMask(frag, minP, maxP);
-  float inner = rectMask(frag, minP + vec2(width), maxP - vec2(width));
-  return max(outer - inner, 0.0);
-}
-
-void applyHudAtFrag(inout vec3 color, inout float alpha, vec2 frag) {
-  float panel = rectMask(frag, vec2(16.0, 16.0), vec2(248.0, 112.0));
-  paint(color, alpha, vec3(0.018, 0.022, 0.026), panel * 0.78);
-  paint(color, alpha, vec3(0.30, 0.36, 0.40), rectEdge(frag, vec2(16.0, 16.0), vec2(248.0, 112.0), 3.0) * 0.70);
-
-  vec3 toolColor = brushUiColor();
-  paint(color, alpha, toolColor, rectMask(frag, vec2(28.0, 28.0), vec2(226.0, 44.0)) * 0.86);
-
-  float sizeBack = rectMask(frag, vec2(54.0, 56.0), vec2(72.0, 104.0));
-  float powerBack = rectMask(frag, vec2(104.0, 84.0), vec2(226.0, 98.0));
-  paint(color, alpha, vec3(0.08, 0.10, 0.12), max(sizeBack, powerBack) * 0.90);
-
-  float sizeNorm = clamp((uBrushRadius - 0.015) / (0.60 - 0.015), 0.0, 1.0);
-  float powerNorm = clamp(uBrushStrength, 0.0, 1.0);
-  float sizeTop = mix(104.0, 56.0, sizeNorm);
-  paint(color, alpha, vec3(0.25, 0.85, 1.0), rectMask(frag, vec2(54.0, sizeTop), vec2(72.0, 104.0)) * 0.95);
-  paint(color, alpha, vec3(1.0, 0.60, 0.24), rectMask(frag, vec2(104.0, 84.0), vec2(104.0 + 122.0 * powerNorm, 98.0)) * 0.95);
-
-  float menuOn = step(0.5, uMenuVisible);
-  vec2 arCenter = vec2(220.0, 84.0);
-  float arDist = length(frag - arCenter);
-  float arFill = (1.0 - smoothstep(17.0, 18.5, arDist)) * menuOn;
-  float arRing = (1.0 - smoothstep(1.8, 3.8, abs(arDist - 18.0))) * menuOn;
-  float arDot = (1.0 - smoothstep(4.0, 8.0, arDist)) * menuOn * step(0.5, uArEnabled);
-  float arHover = (uMenuHoverIndex == 8 ? 1.0 : 0.0) * arFill;
-  vec3 arBase = mix(vec3(0.16, 0.18, 0.20), vec3(0.24, 0.70, 0.58), step(0.5, uArEnabled));
-  arBase = mix(vec3(0.10, 0.11, 0.12), arBase, step(0.5, uArAvailable));
-  paint(color, alpha, arBase, arFill * 0.92);
-  paint(color, alpha, vec3(0.74, 0.88, 0.92), arRing * (0.60 + arHover * 0.35));
-  paint(color, alpha, vec3(0.72, 1.0, 0.84), arDot * 0.90);
-
-  float menuPanel = rectMask(frag, vec2(16.0, 120.0), vec2(248.0, 376.0)) * menuOn;
-  paint(color, alpha, vec3(0.016, 0.019, 0.023), menuPanel * 0.88);
-  paint(color, alpha, vec3(0.30, 0.36, 0.40), rectEdge(frag, vec2(16.0, 120.0), vec2(248.0, 376.0), 3.0) * menuOn * 0.70);
-
-  for (int i = 0; i < 8; ++i) {
-    float top = 132.0 + float(i) * 29.0;
-    float row = rectMask(frag, vec2(28.0, top), vec2(226.0, top + 23.0));
-    vec3 rowColor = i < 4 ? toolPalette(i) : vec3(0.26, 0.30, 0.34);
-    float rowAlpha = i < 4 ? 0.42 : 0.72;
-    paint(color, alpha, rowColor, row * menuOn * rowAlpha);
-    float activeRow = (i == uToolIndex && i < 4) ? 1.0 : 0.0;
-    float hovered = (i == uMenuHoverIndex) ? 1.0 : 0.0;
-    paint(color, alpha, rowColor, row * menuOn * activeRow * 0.46);
-    paint(color, alpha, vec3(0.78, 0.90, 0.96), row * menuOn * hovered * 0.46);
-    paint(color, alpha, vec3(0.82, 0.88, 0.92), rectEdge(frag, vec2(28.0, top), vec2(226.0, top + 23.0), 2.0) * menuOn * (0.18 + activeRow * 0.34));
-  }
+vec3 brushUiColor() {
+  vec3 idleColor = toolPalette(uToolIndex);
+  vec3 activeColor = mix(idleColor, vec3(1.0), 0.35);
+  return mix(idleColor, activeColor, smoothstep(0.50, 0.80, uTriggerValue));
 }
 
 float rayPointDistance(vec3 rayOrigin, vec3 rayDir, vec3 point, out float rayT) {
@@ -4347,9 +4666,9 @@ void applyLeftHandUi(inout vec3 color, inout float alpha, vec3 rayOrigin, vec3 r
 
   vec3 hit = rayOrigin + rayDir * t;
   vec2 local = vec2(dot(hit - center, panelRight), dot(hit - center, panelUp));
-  float contentWidth = 264.0;
-  float contentHeight = mix(128.0, 392.0, step(0.5, uMenuVisible));
-  float panelWidth = 0.34;
+  float contentWidth = uHudVisibleSize.x;
+  float contentHeight = uHudVisibleSize.y;
+  float panelWidth = uPanelWidth;
   float panelHeight = panelWidth * contentHeight / contentWidth;
   if (abs(local.x) > panelWidth * 0.5 || abs(local.y) > panelHeight * 0.5) {
     return;
@@ -4357,7 +4676,132 @@ void applyLeftHandUi(inout vec3 color, inout float alpha, vec3 rayOrigin, vec3 r
 
   vec2 frag = vec2((local.x / panelWidth + 0.5) * contentWidth,
                    (0.5 - local.y / panelHeight) * contentHeight);
-  applyHudAtFrag(color, alpha, frag);
+  vec4 hud = texture(uHud, frag / uHudFullSize);
+  paint(color, alpha, hud.rgb, hud.a);
+}
+
+// Transparent disc on an arbitrary plane: used to preview the Flatten
+// tangent plane and to show the mirror symmetry plane.
+void applyPlaneDisc(inout vec3 color,
+                    inout float alpha,
+                    vec3 rayOrigin,
+                    vec3 rayDir,
+                    vec3 center,
+                    vec3 planeNormal,
+                    float radius,
+                    vec3 tint,
+                    float fillStrength,
+                    float rimStrength) {
+  vec3 n = normalize(planeNormal);
+  float denom = dot(rayDir, n);
+  if (abs(denom) < 0.0005) {
+    return;
+  }
+
+  float t = dot(center - rayOrigin, n) / denom;
+  if (t <= 0.02) {
+    return;
+  }
+
+  vec3 hit = rayOrigin + rayDir * t;
+  float d = length(hit - center);
+  float r = max(radius, 0.01);
+  if (d > r * 1.10) {
+    return;
+  }
+
+  float fill = (1.0 - smoothstep(r * 0.92, r, d)) * fillStrength;
+  float rim = (1.0 - smoothstep(0.0035, 0.011, abs(d - r))) * rimStrength;
+  paint(color, alpha, tint, clamp(fill, 0.0, 1.0));
+  paint(color, alpha, tint, rim);
+}
+
+float sdSphere(vec3 p, float r) {
+  return length(p) - r;
+}
+
+float sdCapsuleSeg(vec3 p, vec3 a, vec3 b, float r) {
+  vec3 pa = p - a;
+  vec3 ba = b - a;
+  float h = clamp(dot(pa, ba) / dot(ba, ba), 0.0, 1.0);
+  return length(pa - ba * h) - r;
+}
+
+float sdBox(vec3 p, vec3 b) {
+  vec3 q = abs(p) - b;
+  return length(max(q, vec3(0.0))) + min(max(q.x, max(q.y, q.z)), 0.0);
+}
+
+// Capped cone along +y, from y=-h (radius r1) to y=+h (radius r2).
+float sdCappedConeY(vec3 p, float h, float r1, float r2) {
+  vec2 q = vec2(length(p.xz), p.y);
+  vec2 k1 = vec2(r2, h);
+  vec2 k2 = vec2(r2 - r1, 2.0 * h);
+  vec2 ca = vec2(q.x - min(q.x, (q.y < 0.0) ? r1 : r2), abs(q.y) - h);
+  vec2 cb = q - k1 + k2 * clamp(dot(k1 - q, k2) / dot(k2, k2), 0.0, 1.0);
+  float s = (cb.x < 0.0 && ca.y < 0.0) ? -1.0 : 1.0;
+  return s * sqrt(min(dot(ca, ca), dot(cb, cb)));
+}
+
+// Ring around the local x axis (lies in the y-z plane).
+float sdTorusX(vec3 p, float ringRadius, float tubeRadius) {
+  vec2 q = vec2(length(p.yz) - ringRadius, p.x);
+  return length(q) - tubeRadius;
+}
+
+// Tool-specific head shape in the gizmo frame (x=right, y=up, z=forward,
+// origin at the tool tip). secondary marks neutral metal parts.
+float toolHeadSdf(vec3 q, float s, out float secondary) {
+  secondary = 0.0;
+  if (uToolIndex == 1) {
+    // Subtract: hollow scoop opening toward the surface.
+    return max(abs(length(q) - s) - 0.0035, q.z - s * 0.25);
+  }
+  if (uToolIndex == 2) {
+    // Smooth: flattened pebble.
+    vec3 radii = vec3(s * 1.15, s * 1.15, s * 0.42);
+    return (length(q / radii) - 1.0) * (s * 0.42);
+  }
+  if (uToolIndex == 3) {
+    // Stretch: pull hook (open torus arc).
+    float d = sdTorusX(q - vec3(0.0, s * 0.35, 0.0), s * 0.75, s * 0.16);
+    return max(d, -(q.y + s * 0.25));
+  }
+  if (uToolIndex == 4) {
+    // Flatten: rigid square plate.
+    return sdBox(q, vec3(s * 1.45, s * 1.45, 0.0045));
+  }
+  if (uToolIndex == 5) {
+    // Groove: chisel point.
+    return sdCappedConeY(q.xzy, s, s * 0.55, 0.002);
+  }
+  if (uToolIndex == 6) {
+    // Crease: two pincer branches converging at the tip.
+    float a = sdCapsuleSeg(q, vec3(-s * 0.75, 0.0, -s * 0.9), vec3(0.0, 0.0, s * 0.55), s * 0.17);
+    float b = sdCapsuleSeg(q, vec3(s * 0.75, 0.0, -s * 0.9), vec3(0.0, 0.0, s * 0.55), s * 0.17);
+    return min(a, b);
+  }
+  if (uToolIndex == 7) {
+    // Paint: brush tuft (selected color) over a metal ferrule.
+    float tuft = sdCappedConeY(vec3(q.x, q.z - s * 0.45, q.y), s * 0.75, s * 0.5, 0.003);
+    float ferrule = sdCapsuleSeg(q, vec3(0.0, 0.0, -s * 0.75), vec3(0.0, 0.0, -s * 0.30), s * 0.42);
+    secondary = ferrule < tuft ? 1.0 : 0.0;
+    return min(tuft, ferrule);
+  }
+  // Add: solid ball of clay.
+  return sdSphere(q, s);
+}
+
+float toolGizmoSdf(vec3 q, float s, out int material) {
+  float secondary = 0.0;
+  float head = toolHeadSdf(q, s, secondary);
+  float handle = sdCapsuleSeg(q, vec3(0.0, 0.0, -0.19), vec3(0.0, 0.0, -0.05), 0.008);
+  if (handle < head) {
+    material = 2;
+    return handle;
+  }
+  material = secondary > 0.5 ? 1 : 0;
+  return head;
 }
 
 void applyRightHandTool(inout vec3 color, inout float alpha, vec3 rayOrigin, vec3 rayDir) {
@@ -4365,26 +4809,62 @@ void applyRightHandTool(inout vec3 color, inout float alpha, vec3 rayOrigin, vec
     return;
   }
 
-  vec3 toolDir = normalize(uRightToolDirection);
-  vec3 tip = uRightToolPosition;
-  vec3 base = tip - toolDir * 0.185;
-  vec3 toolColor = brushUiColor();
+  vec3 f = normalize(uRightToolDirection);
+  vec3 r = cross(vec3(0.0, 1.0, 0.0), f);
+  if (dot(r, r) < 0.01) {
+    r = cross(vec3(1.0, 0.0, 0.0), f);
+  }
+  r = normalize(r);
+  vec3 u = cross(f, r);
+  float s = clamp(uBrushRadius * 0.30, 0.016, 0.045);
 
-  float shaftT = 0.0;
-  float shaftDistance = raySegmentDistance(rayOrigin, rayDir, base, tip, shaftT);
-  float shaft = 1.0 - smoothstep(0.006, 0.014, shaftDistance);
+  // Faint ring showing the actual brush radius around the tip.
+  float ringT = 0.0;
+  float ringDistance = rayPointDistance(rayOrigin, rayDir, uRightToolPosition, ringT);
+  float ringRadius = max(uBrushRadius, 0.010);
+  float ringMask = 1.0 - smoothstep(0.0035, 0.010, abs(ringDistance - ringRadius));
+  paint(color, alpha, brushUiColor(), ringMask * 0.30);
 
-  float headT = 0.0;
-  float headDistance = rayPointDistance(rayOrigin, rayDir, tip, headT);
-  float headRadius = max(uBrushRadius, 0.010);
-  float fill = 1.0 - smoothstep(headRadius * 0.72, headRadius, headDistance);
-  float shell = 1.0 - smoothstep(0.004, 0.012, abs(headDistance - headRadius));
-  float center = 1.0 - smoothstep(0.006, 0.014, headDistance);
+  // Sphere-trace the gizmo inside its bounding sphere only.
+  vec3 boundCenter = uRightToolPosition - f * 0.07;
+  float boundRadius = 0.155 + s * 2.2;
+  vec3 oc = rayOrigin - boundCenter;
+  float ob = dot(oc, rayDir);
+  float oc2 = dot(oc, oc) - boundRadius * boundRadius;
+  float disc = ob * ob - oc2;
+  if (disc < 0.0) {
+    return;
+  }
+  float sqrtDisc = sqrt(disc);
+  float t = max(-ob - sqrtDisc, 0.0);
+  float tEnd = -ob + sqrtDisc;
 
-  paint(color, alpha, mix(vec3(0.74, 0.80, 0.86), toolColor, 0.35), shaft * 0.56);
-  paint(color, alpha, toolColor, fill * 0.08);
-  paint(color, alpha, toolColor, shell * 0.58);
-  paint(color, alpha, vec3(0.92, 0.96, 1.0), center * 0.42);
+  for (int i = 0; i < 28; ++i) {
+    vec3 p = rayOrigin + rayDir * t;
+    vec3 rel = p - uRightToolPosition;
+    vec3 q = vec3(dot(rel, r), dot(rel, u), dot(rel, f));
+    int material = 0;
+    float d = toolGizmoSdf(q, s, material);
+    if (d < 0.0012) {
+      int dummy = 0;
+      vec2 e = vec2(0.0015, 0.0);
+      vec3 nLocal = normalize(vec3(
+          toolGizmoSdf(q + e.xyy, s, dummy) - toolGizmoSdf(q - e.xyy, s, dummy),
+          toolGizmoSdf(q + e.yxy, s, dummy) - toolGizmoSdf(q - e.yxy, s, dummy),
+          toolGizmoSdf(q + e.yyx, s, dummy) - toolGizmoSdf(q - e.yyx, s, dummy)));
+      vec3 n = normalize(r * nLocal.x + u * nLocal.y + f * nLocal.z);
+      vec3 light = normalize(vec3(-0.35, 0.85, 0.42));
+      float diffuse = max(dot(n, light), 0.0);
+      vec3 baseColor = material == 2 ? vec3(0.55, 0.59, 0.65)
+                                     : (material == 1 ? vec3(0.75, 0.78, 0.82) : brushUiColor());
+      paint(color, alpha, baseColor * (0.40 + diffuse * 0.60), 0.96);
+      return;
+    }
+    t += max(d, 0.0008);
+    if (t > tEnd) {
+      return;
+    }
+  }
 }
 
 vec3 handJoint(int hand, int index) {
@@ -4428,7 +4908,7 @@ void applyHandBoneByIndex(inout vec3 color,
                           int a,
                           int b,
                           vec3 boneColor) {
-  applyHandBone(color, alpha, rayOrigin, rayDir, handJoint(hand, a), handJoint(hand, b), boneColor, 0.010, 0.74);
+  applyHandBone(color, alpha, rayOrigin, rayDir, handJoint(hand, a), handJoint(hand, b), boneColor, 0.012, 0.30);
 }
 
 void applyTrackedHand(inout vec3 color, inout float alpha, vec3 rayOrigin, vec3 rayDir, int hand) {
@@ -4437,9 +4917,11 @@ void applyTrackedHand(inout vec3 color, inout float alpha, vec3 rayOrigin, vec3 
     return;
   }
 
-  vec3 baseColor = hand == 0 ? vec3(0.54, 0.95, 1.0) : toolPalette(uToolIndex);
-  vec3 jointColor = mix(baseColor, vec3(1.0), 0.28);
-  vec3 palmColor = mix(baseColor, vec3(0.88, 0.94, 1.0), 0.42);
+  // Classic neutral hands, like the system ones: pale translucent capsules,
+  // identical for both hands; the active tool no longer recolors the hand.
+  vec3 baseColor = vec3(0.80, 0.83, 0.87);
+  vec3 jointColor = baseColor;
+  vec3 palmColor = baseColor;
 
   applyHandBoneByIndex(color, alpha, rayOrigin, rayDir, hand, 1, 0, palmColor);
   applyHandBoneByIndex(color, alpha, rayOrigin, rayDir, hand, 0, 2, palmColor);
@@ -4471,12 +4953,18 @@ void applyTrackedHand(inout vec3 color, inout float alpha, vec3 rayOrigin, vec3 
   applyHandBoneByIndex(color, alpha, rayOrigin, rayDir, hand, 23, 24, baseColor);
   applyHandBoneByIndex(color, alpha, rayOrigin, rayDir, hand, 24, 25, baseColor);
 
-  applyHandJoint(color, alpha, rayOrigin, rayDir, handJoint(hand, 0), palmColor, 0.030, 0.42);
-  applyHandJoint(color, alpha, rayOrigin, rayDir, handJoint(hand, 5), jointColor, 0.016, 0.76);
-  applyHandJoint(color, alpha, rayOrigin, rayDir, handJoint(hand, 10), jointColor, 0.016, 0.76);
-  applyHandJoint(color, alpha, rayOrigin, rayDir, handJoint(hand, 15), jointColor, 0.016, 0.76);
-  applyHandJoint(color, alpha, rayOrigin, rayDir, handJoint(hand, 20), jointColor, 0.016, 0.76);
-  applyHandJoint(color, alpha, rayOrigin, rayDir, handJoint(hand, 25), jointColor, 0.016, 0.76);
+  applyHandJoint(color, alpha, rayOrigin, rayDir, handJoint(hand, 0), palmColor, 0.026, 0.22);
+  applyHandJoint(color, alpha, rayOrigin, rayDir, handJoint(hand, 5), jointColor, 0.012, 0.26);
+  applyHandJoint(color, alpha, rayOrigin, rayDir, handJoint(hand, 10), jointColor, 0.012, 0.26);
+  applyHandJoint(color, alpha, rayOrigin, rayDir, handJoint(hand, 15), jointColor, 0.012, 0.26);
+  applyHandJoint(color, alpha, rayOrigin, rayDir, handJoint(hand, 20), jointColor, 0.012, 0.26);
+  applyHandJoint(color, alpha, rayOrigin, rayDir, handJoint(hand, 25), jointColor, 0.012, 0.26);
+
+  // Small tool-color tip on the right index: it is the finger that sculpts
+  // (pinch) and presses the menu, so it keeps a discreet accent.
+  if (hand == 1) {
+    applyHandJoint(color, alpha, rayOrigin, rayDir, handJoint(1, 10), toolPalette(uToolIndex), 0.007, 0.55);
+  }
 }
 
 void main() {
@@ -4487,6 +4975,14 @@ void main() {
   vec3 color = vec3(0.0);
   float alpha = 0.0;
   applyMenuPointerLine(color, alpha, rayOrigin, rayDir);
+  if (uMirrorPlaneVisible > 0.5) {
+    applyPlaneDisc(color, alpha, rayOrigin, rayDir, uMirrorPlaneCenter, uMirrorPlaneNormal, uMirrorPlaneRadius,
+                   vec3(0.45, 0.75, 1.0), 0.10, 0.45);
+  }
+  if (uFlattenPlaneVisible > 0.5) {
+    applyPlaneDisc(color, alpha, rayOrigin, rayDir, uFlattenPlaneCenter, uFlattenPlaneNormal, uFlattenPlaneRadius,
+                   vec3(1.0, 0.85, 0.25), 0.15, 0.70);
+  }
   applyLeftHandUi(color, alpha, rayOrigin, rayDir);
   applyRightHandTool(color, alpha, rayOrigin, rayDir);
   applyTrackedHand(color, alpha, rayOrigin, rayDir, 0);
@@ -4504,18 +5000,13 @@ void main() {
     uiViewRotationLocation_ = glGetUniformLocation(uiProgram_, "uViewRotation");
     uiFovTangentsLocation_ = glGetUniformLocation(uiProgram_, "uFovTangents");
     uiBrushRadiusLocation_ = glGetUniformLocation(uiProgram_, "uBrushRadius");
-    uiBrushStrengthLocation_ = glGetUniformLocation(uiProgram_, "uBrushStrength");
     uiTriggerValueLocation_ = glGetUniformLocation(uiProgram_, "uTriggerValue");
     uiToolIndexLocation_ = glGetUniformLocation(uiProgram_, "uToolIndex");
-    uiArEnabledLocation_ = glGetUniformLocation(uiProgram_, "uArEnabled");
-    uiArAvailableLocation_ = glGetUniformLocation(uiProgram_, "uArAvailable");
-    uiMenuVisibleLocation_ = glGetUniformLocation(uiProgram_, "uMenuVisible");
     uiLeftUiPositionLocation_ = glGetUniformLocation(uiProgram_, "uLeftUiPosition");
     uiLeftUiVisibleLocation_ = glGetUniformLocation(uiProgram_, "uLeftUiVisible");
     uiRightToolPositionLocation_ = glGetUniformLocation(uiProgram_, "uRightToolPosition");
     uiRightToolDirectionLocation_ = glGetUniformLocation(uiProgram_, "uRightToolDirection");
     uiRightToolVisibleLocation_ = glGetUniformLocation(uiProgram_, "uRightToolVisible");
-    uiMenuHoverIndexLocation_ = glGetUniformLocation(uiProgram_, "uMenuHoverIndex");
     uiMenuPointerActiveLocation_ = glGetUniformLocation(uiProgram_, "uMenuPointerActive");
     uiMenuPointerStartLocation_ = glGetUniformLocation(uiProgram_, "uMenuPointerStart");
     uiMenuPointerEndLocation_ = glGetUniformLocation(uiProgram_, "uMenuPointerEnd");
@@ -4523,22 +5014,350 @@ void main() {
     uiRightHandVisibleLocation_ = glGetUniformLocation(uiProgram_, "uRightHandVisible");
     uiLeftHandJointsLocation_ = glGetUniformLocation(uiProgram_, "uLeftHandJoints[0]");
     uiRightHandJointsLocation_ = glGetUniformLocation(uiProgram_, "uRightHandJoints[0]");
+    uiHudVisibleSizeLocation_ = glGetUniformLocation(uiProgram_, "uHudVisibleSize");
+    uiHudFullSizeLocation_ = glGetUniformLocation(uiProgram_, "uHudFullSize");
+    uiPanelWidthLocation_ = glGetUniformLocation(uiProgram_, "uPanelWidth");
+    uiPaintColorLocation_ = glGetUniformLocation(uiProgram_, "uPaintColor");
+    uiFlattenCenterLocation_ = glGetUniformLocation(uiProgram_, "uFlattenPlaneCenter");
+    uiFlattenNormalLocation_ = glGetUniformLocation(uiProgram_, "uFlattenPlaneNormal");
+    uiFlattenRadiusLocation_ = glGetUniformLocation(uiProgram_, "uFlattenPlaneRadius");
+    uiFlattenVisibleLocation_ = glGetUniformLocation(uiProgram_, "uFlattenPlaneVisible");
+    uiMirrorCenterLocation_ = glGetUniformLocation(uiProgram_, "uMirrorPlaneCenter");
+    uiMirrorNormalLocation_ = glGetUniformLocation(uiProgram_, "uMirrorPlaneNormal");
+    uiMirrorRadiusLocation_ = glGetUniformLocation(uiProgram_, "uMirrorPlaneRadius");
+    uiMirrorVisibleLocation_ = glGetUniformLocation(uiProgram_, "uMirrorPlaneVisible");
+    const GLint hudSamplerLocation = glGetUniformLocation(uiProgram_, "uHud");
 
     if (uiCameraLocation_ < 0 || uiViewRotationLocation_ < 0 || uiFovTangentsLocation_ < 0 ||
-        uiBrushRadiusLocation_ < 0 || uiBrushStrengthLocation_ < 0 || uiTriggerValueLocation_ < 0 ||
-        uiToolIndexLocation_ < 0 || uiArEnabledLocation_ < 0 || uiArAvailableLocation_ < 0 ||
-        uiMenuVisibleLocation_ < 0 || uiLeftUiPositionLocation_ < 0 || uiLeftUiVisibleLocation_ < 0 ||
+        uiBrushRadiusLocation_ < 0 || uiTriggerValueLocation_ < 0 ||
+        uiToolIndexLocation_ < 0 || uiLeftUiPositionLocation_ < 0 || uiLeftUiVisibleLocation_ < 0 ||
         uiRightToolPositionLocation_ < 0 || uiRightToolDirectionLocation_ < 0 ||
-        uiRightToolVisibleLocation_ < 0 || uiMenuHoverIndexLocation_ < 0 || uiMenuPointerActiveLocation_ < 0 ||
+        uiRightToolVisibleLocation_ < 0 || uiMenuPointerActiveLocation_ < 0 ||
         uiMenuPointerStartLocation_ < 0 || uiMenuPointerEndLocation_ < 0 || uiLeftHandVisibleLocation_ < 0 ||
-        uiRightHandVisibleLocation_ < 0 || uiLeftHandJointsLocation_ < 0 || uiRightHandJointsLocation_ < 0) {
+        uiRightHandVisibleLocation_ < 0 || uiLeftHandJointsLocation_ < 0 || uiRightHandJointsLocation_ < 0 ||
+        uiHudVisibleSizeLocation_ < 0 || uiHudFullSizeLocation_ < 0 || uiPanelWidthLocation_ < 0 ||
+        uiPaintColorLocation_ < 0 || uiFlattenCenterLocation_ < 0 || uiFlattenNormalLocation_ < 0 ||
+        uiFlattenRadiusLocation_ < 0 || uiFlattenVisibleLocation_ < 0 || uiMirrorCenterLocation_ < 0 ||
+        uiMirrorNormalLocation_ < 0 || uiMirrorRadiusLocation_ < 0 || uiMirrorVisibleLocation_ < 0 ||
+        hudSamplerLocation < 0) {
       logError("UI overlay shader uniforms are missing");
       return false;
     }
 
+    glGenTextures(1, &hudTexture_);
+    glBindTexture(GL_TEXTURE_2D, hudTexture_);
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_LINEAR);
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_LINEAR);
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE);
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE);
+    glPixelStorei(GL_UNPACK_ALIGNMENT, 1);
+    glTexImage2D(GL_TEXTURE_2D,
+                 0,
+                 GL_RGBA8,
+                 large::hud::kContentWidth,
+                 large::hud::kContentHeight,
+                 0,
+                 GL_RGBA,
+                 GL_UNSIGNED_BYTE,
+                 nullptr);
+    glBindTexture(GL_TEXTURE_2D, 0);
+    const GLenum hudTextureError = glGetError();
+    if (hudTextureError != GL_NO_ERROR) {
+      logError("HUD texture allocation failed: 0x%x", hudTextureError);
+      return false;
+    }
+    hudPainted_ = false;
+
+    glUseProgram(uiProgram_);
+    glUniform1i(hudSamplerLocation, 0);
+    glUseProgram(0);
+
     glGenVertexArrays(1, &uiVao_);
-    logInfo("UI overlay renderer ready");
+    logInfo("UI overlay renderer ready: HUD texture %dx%d",
+            large::hud::kContentWidth,
+            large::hud::kContentHeight);
     return true;
+  }
+
+  struct HudSnapshot {
+    int toolIndex = -1;
+    float radius = 0.0f;
+    float strength = 0.0f;
+    bool menuVisible = false;
+    int hoverIndex = -1;
+    bool arEnabled = false;
+    bool arAvailable = false;
+    bool mirrorEnabled = false;
+    bool lockEnabled = false;
+    int paintColor = 0;
+    bool triggerPressed = false;
+
+    bool operator==(const HudSnapshot& other) const {
+      return toolIndex == other.toolIndex && radius == other.radius && strength == other.strength &&
+             menuVisible == other.menuVisible && hoverIndex == other.hoverIndex && arEnabled == other.arEnabled &&
+             arAvailable == other.arAvailable && mirrorEnabled == other.mirrorEnabled &&
+             lockEnabled == other.lockEnabled && paintColor == other.paintColor &&
+             triggerPressed == other.triggerPressed;
+    }
+  };
+
+  large::hud::Color toolUiColor(int index) const {
+    switch (index) {
+      case 1:
+        return {255, 71, 82, 255};
+      case 2:
+        return {71, 242, 122, 255};
+      case 3:
+        return {209, 112, 255, 255};
+      case 4:
+        return {255, 217, 64, 255};
+      case 5:
+        return {255, 140, 51, 255};
+      case 6:
+        return {140, 199, 242, 255};
+      case 7: {
+        const auto& paint = kPaintPalette[static_cast<std::size_t>(paintColorIndex_)];
+        return {static_cast<std::uint8_t>(paint[0] * 255.0f + 0.5f),
+                static_cast<std::uint8_t>(paint[1] * 255.0f + 0.5f),
+                static_cast<std::uint8_t>(paint[2] * 255.0f + 0.5f),
+                255};
+      }
+      default:
+        return {64, 217, 255, 255};
+    }
+  }
+
+  // Small silhouette of each tool, matching its 3D gizmo: drawn in the menu
+  // rows and in the header bar so tools are identified by shape, not color.
+  void drawToolIcon(int tool, int centerX, int centerY, large::hud::Color color, large::hud::Color accent) {
+    large::hud::Painter& p = hudPainter_;
+    switch (tool) {
+      case 1:  // Subtract: hollow scoop
+        p.ring(centerX, centerY, 7, 3, color);
+        break;
+      case 2:  // Smooth: flat pebble
+        p.fillRect(centerX - 6, centerY - 3, centerX + 6, centerY + 3, color);
+        p.fillCircle(centerX - 6, centerY, 3, color);
+        p.fillCircle(centerX + 6, centerY, 3, color);
+        break;
+      case 3:  // Stretch: pull arrow
+        p.fillTriangle(centerX - 6, centerY - 1, centerX + 6, centerY - 1, centerX, centerY - 9, color);
+        p.fillRect(centerX - 2, centerY - 1, centerX + 2, centerY + 9, color);
+        break;
+      case 4:  // Flatten: plate on a stem
+        p.fillRect(centerX - 8, centerY - 7, centerX + 8, centerY - 3, color);
+        p.fillRect(centerX - 2, centerY - 3, centerX + 2, centerY + 8, color);
+        break;
+      case 5:  // Groove: chisel point
+        p.fillTriangle(centerX - 7, centerY - 7, centerX + 7, centerY - 7, centerX, centerY + 9, color);
+        break;
+      case 6:  // Crease: converging pincer
+        p.fillTriangle(centerX - 8, centerY + 8, centerX - 4, centerY + 8, centerX, centerY - 8, color);
+        p.fillTriangle(centerX + 4, centerY + 8, centerX + 8, centerY + 8, centerX, centerY - 8, color);
+        break;
+      case 7:  // Paint: brush with the selected color as tuft
+        p.fillTriangle(centerX - 5, centerY, centerX + 5, centerY, centerX, centerY - 9, accent);
+        p.fillRect(centerX - 5, centerY, centerX + 5, centerY + 4, color);
+        p.fillRect(centerX - 2, centerY + 4, centerX + 2, centerY + 9, color);
+        break;
+      default:  // Add: solid ball of clay
+        p.fillCircle(centerX, centerY, 7, color);
+        break;
+    }
+  }
+
+  void paintHud(const HudSnapshot& snap) {
+    namespace hud = large::hud;
+    hud::Painter& p = hudPainter_;
+    p.clear();
+
+    const hud::Color panelBg{5, 6, 7, 205};
+    const hud::Color panelEdge{77, 92, 102, 185};
+    const hud::Color barBg{20, 26, 31, 235};
+    const hud::Color textMain{235, 242, 248, 255};
+    const hud::Color textDim{150, 162, 172, 255};
+    const hud::Color textDark{12, 14, 16, 255};
+
+    // Header: active tool, brush size and strength, shortcut reminders.
+    p.fillRect(hud::kHeaderLeft, hud::kHeaderTop, hud::kHeaderRight, hud::kHeaderBottom, panelBg);
+    p.outlineRect(hud::kHeaderLeft, hud::kHeaderTop, hud::kHeaderRight, hud::kHeaderBottom, 2, panelEdge);
+
+    hud::Color toolColor = toolUiColor(snap.toolIndex);
+    toolColor.a = snap.triggerPressed ? 255 : 210;
+    p.fillRect(hud::kToolBarLeft, hud::kToolBarTop, hud::kToolBarRight, hud::kToolBarBottom, toolColor);
+    char nameBuffer[16] = {};
+    const char* name = toolName(toolFromIndex(snap.toolIndex));
+    for (int i = 0; name[i] != '\0' && i < 15; ++i) {
+      nameBuffer[i] = static_cast<char>(std::toupper(static_cast<unsigned char>(name[i])));
+    }
+    const int toolBarCenterY = (hud::kToolBarTop + hud::kToolBarBottom) / 2;
+    drawToolIcon(snap.toolIndex, hud::kToolBarLeft + 16, toolBarCenterY, textDark, textDark);
+    p.drawTextCentered((hud::kToolBarLeft + hud::kToolBarRight) / 2 + 10, hud::kToolBarTop + 3, nameBuffer, 2,
+                       textDark);
+
+    // MENU toggle button (finger poke or controller ray).
+    const bool menuButtonHovered = snap.hoverIndex == kMenuToggleChoice;
+    hud::Color menuButtonColor = snap.menuVisible ? hud::Color{61, 179, 148, 235} : hud::Color{66, 76, 86, 220};
+    p.fillRect(hud::kMenuButtonLeft, hud::kMenuButtonTop, hud::kMenuButtonRight, hud::kMenuButtonBottom,
+               menuButtonColor);
+    if (menuButtonHovered) {
+      p.fillRect(hud::kMenuButtonLeft, hud::kMenuButtonTop, hud::kMenuButtonRight, hud::kMenuButtonBottom,
+                 {200, 230, 245, 95});
+    }
+    p.outlineRect(hud::kMenuButtonLeft, hud::kMenuButtonTop, hud::kMenuButtonRight, hud::kMenuButtonBottom, 2,
+                  snap.menuVisible ? textMain : panelEdge);
+    p.drawTextCentered((hud::kMenuButtonLeft + hud::kMenuButtonRight) / 2,
+                       (hud::kMenuButtonTop + hud::kMenuButtonBottom) / 2 - 3, "MENU", 1, textMain);
+
+    char valueBuffer[16] = {};
+    p.drawText(hud::kToolBarLeft, hud::kSizeRowY, "SIZE", 1, textDim);
+    p.fillRect(hud::kBarLeft, hud::kSizeRowY - 1, hud::kBarRight, hud::kSizeRowY - 1 + hud::kBarHeight, barBg);
+    const float sizeNorm = large::sdf::clamp(
+        (snap.radius - kMinimumBrushRadius) / (kMaximumBrushRadius - kMinimumBrushRadius), 0.0f, 1.0f);
+    p.fillRect(hud::kBarLeft,
+               hud::kSizeRowY - 1,
+               hud::kBarLeft + static_cast<int>((hud::kBarRight - hud::kBarLeft) * sizeNorm),
+               hud::kSizeRowY - 1 + hud::kBarHeight,
+               {64, 217, 255, 255});
+    std::snprintf(valueBuffer, sizeof(valueBuffer), "%.0fCM", snap.radius * 100.0f);
+    p.drawText(hud::kBarRight + 6, hud::kSizeRowY, valueBuffer, 1, textMain);
+
+    p.drawText(hud::kToolBarLeft, hud::kPowerRowY, "POWER", 1, textDim);
+    p.fillRect(hud::kBarLeft, hud::kPowerRowY - 1, hud::kBarRight, hud::kPowerRowY - 1 + hud::kBarHeight, barBg);
+    const float powerNorm = large::sdf::clamp(snap.strength, 0.0f, 1.0f);
+    p.fillRect(hud::kBarLeft,
+               hud::kPowerRowY - 1,
+               hud::kBarLeft + static_cast<int>((hud::kBarRight - hud::kBarLeft) * powerNorm),
+               hud::kPowerRowY - 1 + hud::kBarHeight,
+               {255, 153, 61, 255});
+    std::snprintf(valueBuffer, sizeof(valueBuffer), "%.0f%%", powerNorm * 100.0f);
+    p.drawText(hud::kBarRight + 6, hud::kPowerRowY, valueBuffer, 1, textMain);
+
+    p.drawText(hud::kToolBarLeft, hud::kFooterY, "X:UNDO Y:REDO A/B:TOOL", 1, textDim);
+
+    if (!snap.menuVisible) {
+      return;
+    }
+
+    // Menu: tools column on the left, action column on the right, palette
+    // full width below.
+    p.fillRect(hud::kHeaderLeft, hud::kMenuPanelTop, hud::kHeaderRight, hud::kMenuPanelBottom, panelBg);
+    p.outlineRect(hud::kHeaderLeft, hud::kMenuPanelTop, hud::kHeaderRight, hud::kMenuPanelBottom, 2, panelEdge);
+
+    static const char* kToolLabels[hud::kMenuToolRowCount] = {
+        "ADD", "SUBTRACT", "SMOOTH", "STRETCH", "FLATTEN", "GROOVE", "CREASE", "PAINT",
+    };
+    const auto& selectedPaint = kPaintPalette[static_cast<std::size_t>(snap.paintColor)];
+    const hud::Color paintAccent{static_cast<std::uint8_t>(selectedPaint[0] * 255.0f + 0.5f),
+                                 static_cast<std::uint8_t>(selectedPaint[1] * 255.0f + 0.5f),
+                                 static_cast<std::uint8_t>(selectedPaint[2] * 255.0f + 0.5f),
+                                 255};
+    for (int i = 0; i < hud::kMenuToolRowCount; ++i) {
+      const int top = hud::kMenuRowTop + i * hud::kMenuRowPitch;
+      const bool active = i == snap.toolIndex;
+      const bool hovered = i == snap.hoverIndex;
+
+      hud::Color rowColor = toolUiColor(i);
+      rowColor.a = active ? 235 : 110;
+      p.fillRect(hud::kMenuToolColumnLeft, top, hud::kMenuToolColumnRight, top + hud::kMenuRowHeight, rowColor);
+      if (hovered) {
+        p.fillRect(hud::kMenuToolColumnLeft, top, hud::kMenuToolColumnRight, top + hud::kMenuRowHeight,
+                   {200, 230, 245, 95});
+      }
+      p.outlineRect(hud::kMenuToolColumnLeft, top, hud::kMenuToolColumnRight, top + hud::kMenuRowHeight, 1,
+                    active ? textMain : panelEdge);
+      drawToolIcon(i, hud::kMenuToolColumnLeft + hud::kMenuIconCenterOffset, top + hud::kMenuRowHeight / 2,
+                   textMain, paintAccent);
+      p.drawTextCentered((hud::kMenuToolColumnLeft + 2 * hud::kMenuIconCenterOffset + hud::kMenuToolColumnRight) / 2,
+                         top + 5, kToolLabels[i], 2, textMain);
+    }
+
+    static const char* kActionLabels[hud::kMenuActionRowCount] = {
+        "SAVE", "LOAD", "EXPORT", "QUIT", "AR", "MIRROR", "LOCK",
+    };
+    for (int i = 0; i < hud::kMenuActionRowCount; ++i) {
+      const int top = hud::kMenuRowTop + i * hud::kMenuRowPitch;
+      const int choice = kMenuToolCount + i;
+      const bool isArRow = choice == kMenuArChoice;
+      const bool isMirrorRow = choice == kMenuMirrorChoice;
+      const bool isLockRow = choice == kMenuLockChoice;
+      const bool toggledOn = (isArRow && snap.arEnabled) || (isMirrorRow && snap.mirrorEnabled) ||
+                             (isLockRow && snap.lockEnabled);
+      const bool hovered = choice == snap.hoverIndex;
+
+      hud::Color rowColor = toggledOn ? hud::Color{61, 179, 148, 225} : hud::Color{66, 76, 86, 190};
+      if (isArRow && !snap.arAvailable) {
+        rowColor = {40, 45, 50, 190};
+      }
+      p.fillRect(hud::kMenuActionColumnLeft, top, hud::kMenuActionColumnRight, top + hud::kMenuRowHeight, rowColor);
+      if (hovered) {
+        p.fillRect(hud::kMenuActionColumnLeft, top, hud::kMenuActionColumnRight, top + hud::kMenuRowHeight,
+                   {200, 230, 245, 95});
+      }
+      p.outlineRect(hud::kMenuActionColumnLeft, top, hud::kMenuActionColumnRight, top + hud::kMenuRowHeight, 1,
+                    toggledOn ? textMain : panelEdge);
+      const hud::Color labelColor = (isArRow && !snap.arAvailable) ? textDim : textMain;
+      p.drawTextCentered((hud::kMenuActionColumnLeft + hud::kMenuActionColumnRight) / 2, top + 5, kActionLabels[i],
+                         2, labelColor);
+    }
+
+    p.drawText(hud::kPaletteLeft, hud::kPaletteLabelY, "PAINT COLOR", 1, textDim);
+    for (int i = 0; i < hud::kPaletteCount; ++i) {
+      const int column = i % hud::kPaletteColumns;
+      const int row = i / hud::kPaletteColumns;
+      const int x = hud::kPaletteLeft + column * hud::kPalettePitch;
+      const int y = hud::kPaletteTop + row * hud::kPalettePitch;
+      const auto& paint = kPaintPalette[static_cast<std::size_t>(i)];
+      const hud::Color swatch{static_cast<std::uint8_t>(paint[0] * 255.0f + 0.5f),
+                              static_cast<std::uint8_t>(paint[1] * 255.0f + 0.5f),
+                              static_cast<std::uint8_t>(paint[2] * 255.0f + 0.5f),
+                              255};
+      p.fillRect(x, y, x + hud::kPaletteSwatch, y + hud::kPaletteSwatch, swatch);
+      const bool selected = i == snap.paintColor;
+      const bool hovered = snap.hoverIndex == kMenuPaletteFirstChoice + i;
+      if (selected || hovered) {
+        p.outlineRect(x, y, x + hud::kPaletteSwatch, y + hud::kPaletteSwatch, 3,
+                      selected ? textMain : textDim);
+      }
+    }
+  }
+
+  void updateHudTexture() {
+    if (hudTexture_ == 0) {
+      return;
+    }
+
+    HudSnapshot snap{};
+    snap.toolIndex = displayToolIndex();
+    snap.radius = brushRadius_;
+    snap.strength = brushStrength_;
+    snap.menuVisible = menuVisible_;
+    snap.hoverIndex = menuHoverIndex_;
+    snap.arEnabled = arModeEnabled_;
+    snap.arAvailable = passthroughReady_;
+    snap.mirrorEnabled = mirrorEnabled_;
+    snap.lockEnabled = objectLocked_;
+    snap.paintColor = paintColorIndex_;
+    snap.triggerPressed = rightTriggerValue_ >= kTriggerThreshold;
+    if (hudPainted_ && snap == hudSnapshot_) {
+      return;
+    }
+
+    paintHud(snap);
+    glBindTexture(GL_TEXTURE_2D, hudTexture_);
+    glPixelStorei(GL_UNPACK_ALIGNMENT, 1);
+    glTexSubImage2D(GL_TEXTURE_2D,
+                    0,
+                    0,
+                    0,
+                    large::hud::kContentWidth,
+                    large::hud::kContentHeight,
+                    GL_RGBA,
+                    GL_UNSIGNED_BYTE,
+                    hudPainter_.pixels());
+    glBindTexture(GL_TEXTURE_2D, 0);
+    hudSnapshot_ = snap;
+    hudPainted_ = true;
   }
 
   void renderUiOverlayForEye(int eye) {
@@ -4568,7 +5387,9 @@ void main() {
     const std::array<float, XR_HAND_JOINT_COUNT_EXT * 3> leftHandJoints = buildHandUniform(leftHandState_);
     const std::array<float, XR_HAND_JOINT_COUNT_EXT * 3> rightHandJoints = buildHandUniform(rightHandState_);
     glEnable(GL_BLEND);
-    glBlendFunc(GL_SRC_ALPHA, GL_ONE_MINUS_SRC_ALPHA);
+    // Separate alpha blend so the UI also raises the destination alpha,
+    // keeping it visible over passthrough in AR mode.
+    glBlendFuncSeparate(GL_SRC_ALPHA, GL_ONE_MINUS_SRC_ALPHA, GL_ONE, GL_ONE_MINUS_SRC_ALPHA);
     glUseProgram(uiProgram_);
     glUniform3f(uiCameraLocation_, pose.position.x, pose.position.y, pose.position.z);
     glUniformMatrix3fv(uiViewRotationLocation_, 1, GL_FALSE, viewRotation.data());
@@ -4578,18 +5399,13 @@ void main() {
                 std::tan(views_[eye].fov.angleDown),
                 std::tan(views_[eye].fov.angleUp));
     glUniform1f(uiBrushRadiusLocation_, brushRadius_);
-    glUniform1f(uiBrushStrengthLocation_, brushStrength_);
     glUniform1f(uiTriggerValueLocation_, rightTriggerValue_);
     glUniform1i(uiToolIndexLocation_, displayToolIndex());
-    glUniform1f(uiArEnabledLocation_, arModeEnabled_ ? 1.0f : 0.0f);
-    glUniform1f(uiArAvailableLocation_, passthroughReady_ ? 1.0f : 0.0f);
-    glUniform1f(uiMenuVisibleLocation_, menuVisible_ ? 1.0f : 0.0f);
     glUniform3f(uiLeftUiPositionLocation_, uiPosition.x, uiPosition.y, uiPosition.z);
     glUniform1f(uiLeftUiVisibleLocation_, isLeftUiVisible() ? 1.0f : 0.0f);
     glUniform3f(uiRightToolPositionLocation_, rightToolPosition_.x, rightToolPosition_.y, rightToolPosition_.z);
     glUniform3f(uiRightToolDirectionLocation_, rightToolDirection_.x, rightToolDirection_.y, rightToolDirection_.z);
     glUniform1f(uiRightToolVisibleLocation_, rightToolVisible_ ? 1.0f : 0.0f);
-    glUniform1i(uiMenuHoverIndexLocation_, menuHoverIndex_);
     glUniform1f(uiMenuPointerActiveLocation_, menuPointerActive_ ? 1.0f : 0.0f);
     glUniform3f(uiMenuPointerStartLocation_, menuPointerStart_.x, menuPointerStart_.y, menuPointerStart_.z);
     glUniform3f(uiMenuPointerEndLocation_, menuPointerEnd_.x, menuPointerEnd_.y, menuPointerEnd_.z);
@@ -4597,9 +5413,45 @@ void main() {
     glUniform1f(uiRightHandVisibleLocation_, rightHandState_.active ? 1.0f : 0.0f);
     glUniform3fv(uiLeftHandJointsLocation_, XR_HAND_JOINT_COUNT_EXT, leftHandJoints.data());
     glUniform3fv(uiRightHandJointsLocation_, XR_HAND_JOINT_COUNT_EXT, rightHandJoints.data());
+    glUniform2f(uiHudVisibleSizeLocation_,
+                static_cast<float>(large::hud::kContentWidth),
+                static_cast<float>(menuVisible_ ? large::hud::kContentHeight : large::hud::kHeaderVisibleHeight));
+    glUniform2f(uiHudFullSizeLocation_,
+                static_cast<float>(large::hud::kContentWidth),
+                static_cast<float>(large::hud::kContentHeight));
+    glUniform1f(uiPanelWidthLocation_, large::hud::kPanelWidthMeters);
+    const auto& paintColor = kPaintPalette[static_cast<std::size_t>(paintColorIndex_)];
+    glUniform3f(uiPaintColorLocation_, paintColor[0], paintColor[1], paintColor[2]);
+    glUniform3f(uiFlattenCenterLocation_,
+                flattenPreviewCenterWorld_.x,
+                flattenPreviewCenterWorld_.y,
+                flattenPreviewCenterWorld_.z);
+    glUniform3f(uiFlattenNormalLocation_,
+                flattenPreviewNormalWorld_.x,
+                flattenPreviewNormalWorld_.y,
+                flattenPreviewNormalWorld_.z);
+    glUniform1f(uiFlattenRadiusLocation_, brushRadius_ * 1.25f);
+    glUniform1f(uiFlattenVisibleLocation_, flattenPreviewVisible_ ? 1.0f : 0.0f);
+    // Mirror plane disc: local X=0, sized to the sculpted region.
+    const large::sdf::Vec3 boundsMin = renderBoundsMin();
+    const large::sdf::Vec3 boundsExtent = renderBoundsExtent();
+    const large::sdf::Vec3 mirrorCenterLocal{
+        0.0f, boundsMin.y + boundsExtent.y * 0.5f, boundsMin.z + boundsExtent.z * 0.5f};
+    const float mirrorRadiusLocal =
+        large::sdf::clamp(std::max(boundsExtent.y, boundsExtent.z) * 0.5f + 0.08f, 0.25f, 0.90f);
+    const large::sdf::Vec3 mirrorCenterWorld = objectToWorldPoint(mirrorCenterLocal);
+    const large::sdf::Vec3 mirrorNormalWorld =
+        large::sdf::normalize(rotateByQuaternion(objectRotation_, {1.0f, 0.0f, 0.0f}));
+    glUniform3f(uiMirrorCenterLocation_, mirrorCenterWorld.x, mirrorCenterWorld.y, mirrorCenterWorld.z);
+    glUniform3f(uiMirrorNormalLocation_, mirrorNormalWorld.x, mirrorNormalWorld.y, mirrorNormalWorld.z);
+    glUniform1f(uiMirrorRadiusLocation_, mirrorRadiusLocal * objectScale_);
+    glUniform1f(uiMirrorVisibleLocation_, mirrorEnabled_ ? 1.0f : 0.0f);
+    glActiveTexture(GL_TEXTURE0);
+    glBindTexture(GL_TEXTURE_2D, hudTexture_);
     glBindVertexArray(uiVao_);
     glDrawArrays(GL_TRIANGLES, 0, 3);
     glBindVertexArray(0);
+    glBindTexture(GL_TEXTURE_2D, 0);
     glUseProgram(0);
     glDisable(GL_BLEND);
   }
@@ -4655,6 +5507,14 @@ void main() {
     if (sdfTexture_ != 0) {
       glDeleteTextures(1, &sdfTexture_);
       sdfTexture_ = 0;
+    }
+    if (colorTexture_ != 0) {
+      glDeleteTextures(1, &colorTexture_);
+      colorTexture_ = 0;
+    }
+    if (hudTexture_ != 0) {
+      glDeleteTextures(1, &hudTexture_);
+      hudTexture_ = 0;
     }
     if (sdfVao_ != 0) {
       glDeleteVertexArrays(1, &sdfVao_);
@@ -4751,6 +5611,7 @@ void main() {
       nextToolAction_ = XR_NULL_HANDLE;
       previousToolAction_ = XR_NULL_HANDLE;
       brushAdjustAction_ = XR_NULL_HANDLE;
+      locomotionAction_ = XR_NULL_HANDLE;
       undoAction_ = XR_NULL_HANDLE;
       redoAction_ = XR_NULL_HANDLE;
       menuAction_ = XR_NULL_HANDLE;
@@ -4793,8 +5654,17 @@ void main() {
   GLuint sdfProgram_ = 0;
   GLuint sdfVao_ = 0;
   GLuint sdfTexture_ = 0;
+  GLuint colorTexture_ = 0;
+  GLuint hudTexture_ = 0;
   std::vector<float> uploadScratch_;
+  std::vector<std::uint8_t> colorVoxels_;
+  std::vector<std::uint8_t> colorUploadScratch_;
+  large::sdf::VoxelBounds colorDirtyBounds_{};
   large::sdf::VoxelBounds renderBounds_{};
+  large::hud::Painter hudPainter_{large::hud::kContentWidth, large::hud::kContentHeight};
+  HudSnapshot hudSnapshot_{};
+  bool hudPainted_ = false;
+  int paintColorIndex_ = 3;
   GLuint uiProgram_ = 0;
   GLuint uiVao_ = 0;
   GLint sdfCameraLocation_ = -1;
@@ -4808,39 +5678,20 @@ void main() {
   GLint sdfObjectRotationLocation_ = -1;
   GLint sdfObjectInvRotationLocation_ = -1;
   GLint sdfObjectScaleLocation_ = -1;
-  GLint sdfBrushCenterLocation_ = -1;
-  GLint sdfBrushRadiusLocation_ = -1;
-  GLint sdfBrushVisibleLocation_ = -1;
-  GLint sdfTriggerValueLocation_ = -1;
-  GLint sdfToolIndexLocation_ = -1;
-  GLint sdfBrushStrengthLocation_ = -1;
   GLint sdfArEnabledLocation_ = -1;
-  GLint sdfMenuVisibleLocation_ = -1;
-  GLint sdfLeftUiPositionLocation_ = -1;
-  GLint sdfLeftUiVisibleLocation_ = -1;
-  GLint sdfRightToolPositionLocation_ = -1;
-  GLint sdfRightToolDirectionLocation_ = -1;
-  GLint sdfRightToolVisibleLocation_ = -1;
-  GLint sdfMenuHoverIndexLocation_ = -1;
-  GLint sdfMenuPointerActiveLocation_ = -1;
-  GLint sdfMenuPointerStartLocation_ = -1;
-  GLint sdfMenuPointerEndLocation_ = -1;
+  GLint sdfWorldOffsetLocation_ = -1;
+  GLint sdfVoxelSizeLocation_ = -1;
   GLint uiCameraLocation_ = -1;
   GLint uiViewRotationLocation_ = -1;
   GLint uiFovTangentsLocation_ = -1;
   GLint uiBrushRadiusLocation_ = -1;
-  GLint uiBrushStrengthLocation_ = -1;
   GLint uiTriggerValueLocation_ = -1;
   GLint uiToolIndexLocation_ = -1;
-  GLint uiArEnabledLocation_ = -1;
-  GLint uiArAvailableLocation_ = -1;
-  GLint uiMenuVisibleLocation_ = -1;
   GLint uiLeftUiPositionLocation_ = -1;
   GLint uiLeftUiVisibleLocation_ = -1;
   GLint uiRightToolPositionLocation_ = -1;
   GLint uiRightToolDirectionLocation_ = -1;
   GLint uiRightToolVisibleLocation_ = -1;
-  GLint uiMenuHoverIndexLocation_ = -1;
   GLint uiMenuPointerActiveLocation_ = -1;
   GLint uiMenuPointerStartLocation_ = -1;
   GLint uiMenuPointerEndLocation_ = -1;
@@ -4848,6 +5699,18 @@ void main() {
   GLint uiRightHandVisibleLocation_ = -1;
   GLint uiLeftHandJointsLocation_ = -1;
   GLint uiRightHandJointsLocation_ = -1;
+  GLint uiHudVisibleSizeLocation_ = -1;
+  GLint uiHudFullSizeLocation_ = -1;
+  GLint uiPanelWidthLocation_ = -1;
+  GLint uiPaintColorLocation_ = -1;
+  GLint uiFlattenCenterLocation_ = -1;
+  GLint uiFlattenNormalLocation_ = -1;
+  GLint uiFlattenRadiusLocation_ = -1;
+  GLint uiFlattenVisibleLocation_ = -1;
+  GLint uiMirrorCenterLocation_ = -1;
+  GLint uiMirrorNormalLocation_ = -1;
+  GLint uiMirrorRadiusLocation_ = -1;
+  GLint uiMirrorVisibleLocation_ = -1;
   XrActionSet actionSet_ = XR_NULL_HANDLE;
   XrAction rightAimPoseAction_ = XR_NULL_HANDLE;
   XrAction rightTriggerAction_ = XR_NULL_HANDLE;
@@ -4856,6 +5719,7 @@ void main() {
   XrAction nextToolAction_ = XR_NULL_HANDLE;
   XrAction previousToolAction_ = XR_NULL_HANDLE;
   XrAction brushAdjustAction_ = XR_NULL_HANDLE;
+  XrAction locomotionAction_ = XR_NULL_HANDLE;
   XrAction undoAction_ = XR_NULL_HANDLE;
   XrAction redoAction_ = XR_NULL_HANDLE;
   XrAction menuAction_ = XR_NULL_HANDLE;
@@ -4905,12 +5769,7 @@ void main() {
   float rightTriggerValue_ = 0.0f;
   XrVector2f leftStickValue_{0.0f, 0.0f};
   VrTool activeTool_ = VrTool::Add;
-  std::array<ToolSettings, kVrToolCount> toolSettings_{
-      ToolSettings{},
-      ToolSettings{},
-      ToolSettings{},
-      ToolSettings{},
-  };
+  std::array<ToolSettings, kVrToolCount> toolSettings_{};
   int handDisplayToolIndex_ = -1;
   bool nextToolWasDown_ = false;
   bool previousToolWasDown_ = false;
@@ -4941,6 +5800,18 @@ void main() {
   large::sdf::Vec3 stretchPullStartControllerLocal_{};
   XrQuaternionf stretchPullStartToolOrientationLocal_{0.0f, 0.0f, 0.0f, 1.0f};
   large::sdf::VoxelBounds stretchUploadBounds_{};
+  large::sdf::Vec3 strokeLastLocal_{};
+  bool strokeHasLast_ = false;
+  large::sdf::Vec3 flattenPlanePointLocal_{};
+  large::sdf::Vec3 flattenPlaneNormalLocal_{0.0f, 1.0f, 0.0f};
+  bool flattenPreviewVisible_ = false;
+  large::sdf::Vec3 flattenPreviewCenterWorld_{};
+  large::sdf::Vec3 flattenPreviewNormalWorld_{0.0f, 1.0f, 0.0f};
+  bool mirrorEnabled_ = false;
+  bool objectLocked_ = false;
+  bool handPokeWasTouching_ = false;
+  large::sdf::Vec3 worldOffset_{};
+  XrTime lastLocomotionTime_ = 0;
   ControllerPose leftGripPose_{};
   ControllerPose rightGripPose_{};
   bool leftGripActive_ = false;

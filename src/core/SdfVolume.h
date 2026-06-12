@@ -49,8 +49,19 @@ class SdfVolume {
   void fillSphere(Vec3 center, float radius);
   void applySphereBrush(Vec3 center, float radius, BrushMode mode);
   void applySphereBrush(Vec3 center, float radius, BrushMode mode, float strength);
+  void applyCapsuleBrush(Vec3 start, Vec3 end, float radius, BrushMode mode, float strength);
+  void applyFlattenBrush(Vec3 center, Vec3 planePoint, Vec3 planeNormal, float radius, float strength);
+  void applyPinchBrush(Vec3 center, float radius, float strength);
   void applySmoothBrush(Vec3 center, float radius, float strength);
-  void applyStretchBrush(const SdfVolume& source, Vec3 anchor, Vec3 delta, float radius, float strength);
+  // resetToSource restores the whole volume from `source` before warping;
+  // pass false to layer a second stretch (e.g. the mirrored half) on top of
+  // one applied in the same frame.
+  void applyStretchBrush(const SdfVolume& source,
+                         Vec3 anchor,
+                         Vec3 delta,
+                         float radius,
+                         float strength,
+                         bool resetToSource = true);
   void applyStretchBrush(const SdfVolume& source,
                          Vec3 anchor,
                          Vec3 delta,
@@ -58,7 +69,8 @@ class SdfVolume {
                          Vec3 rotationY,
                          Vec3 rotationZ,
                          float radius,
-                         float strength);
+                         float strength,
+                         bool resetToSource = true);
   SdfVolume resampled(int resolution) const;
 
   bool isSolid(int x, int y, int z) const;

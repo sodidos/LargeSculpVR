@@ -22,13 +22,20 @@ manettes et le suivi des mains comme controles principaux.
 - Prototype actuel : en mode Stretch, la gachette droite definit la zone
   attrapee et le mouvement de la manette deplace cette zone.
 - Prototype actuel : un outil spatial apparait a la position de la manette
-  droite, avec manche court et tete coloree selon l'outil actif.
+  droite, avec manche court et une tete 3D dont la forme identifie l'outil
+  (raymarching SDF dans la passe UI, ombrage reel) : boule pleine = Add,
+  cuillere creuse = Subtract, galet plat = Smooth, crochet = Stretch, taloche
+  carree = Flatten, burin pointu = Groove, pince = Crease, pinceau avec touffe
+  de la couleur choisie = Paint. Un anneau discret indique le rayon reel du
+  pinceau. Les memes silhouettes servent de mini-icones dans le menu et la
+  barre d'en-tete ; la couleur reste un indice secondaire.
 - Prototype actuel : pincement de la main droite pres de la surface lance aussi
   Stretch, avec la zone pincee comme ancre.
 - Prototype actuel : clap des deux mains ouvertes = outil suivant ; pincement
   droit = application de l'outil actif a la surface.
-- Prototype actuel : les mains suivies sont dessinees en squelette/capsules
-  dans la passe UI separee.
+- Prototype actuel : les mains suivies sont dessinees en capsules gris pale
+  translucides (style mains systeme Meta) dans la passe UI separee, avec une
+  pastille couleur outil au bout de l'index droit.
 - Grip : manipulation de l'objet, meme en mode Stretch.
 - A/B : outil suivant / precedent.
 
@@ -59,13 +66,30 @@ manettes et le suivi des mains comme controles principaux.
 
 ## Outils
 
-- Add : ajoute de la matiere avec une intensite faible par defaut.
-- Subtract : retire de la matiere avec le meme falloff.
+- Add : ajoute de la matiere ; fonctionne aussi en espace vide pour creer la
+  premiere matiere (la scene demarre vierge). Les stamps successifs d'un trait
+  sont relies par des capsules pour rester continus.
+- Subtract : retire de la matiere avec le meme falloff, traits continus aussi.
 - Smooth : lissage local prioritaire pour rendre la surface sculptable.
+- Flatten : au debut du trait, le plan tangent est verrouille sur le point de
+  contact ; tout le trait aplatit vers ce plan (rase les bosses, comble les
+  creux). C'est l'outil hard surface principal, inspire de Medium.
+- Groove : creuse une rainure fine (capsule de rayon ~1/3 du pinceau) le long
+  du mouvement, pour les lignes de panneaux et details hard surface.
+- Crease : re-echantillonne le champ depuis des positions ecartees du centre
+  du pinceau, ce qui contracte la matiere vers le trait et affute les aretes
+  (pinch de Medium).
+- Paint : depose la couleur de la palette dans un volume couleur RGBA8
+  echantillonne par le shader comme albedo ; la peinture est limitee a une
+  bande etroite autour de la surface. L'undo/redo capture aussi les couleurs,
+  et l'export OBJ ecrit les couleurs de sommets (v x y z r g b).
 - Stretch manette : gachette droite pose l'ancre sur la surface, puis le
-  mouvement de la manette droite tire la zone ; les voxels autour suivent avec
-  une influence proportionnelle au rayon et a l'intensite. Relacher la gachette
-  libere l'ancre pour choisir une autre zone au prochain appui.
+  mouvement de la manette droite tire la zone. L'influence suit tout le trajet
+  de traction (capsule ancre vers main, rampe axiale) : la base reste attachee
+  au corps et un cou effile se forme, meme en tirant au-dela du rayon. Une
+  passe de relaxation ponderee par le warp re-regularise le champ pour eviter
+  les surfaces dechirees. Relacher la gachette libere l'ancre pour choisir une
+  autre zone au prochain appui.
 - Outils mains : le pincement droit applique l'outil actif a la position
   pincee. Add cree de la matiere, Stretch tire directement la zone pincee,
   Subtract efface, Smooth lisse.
@@ -75,15 +99,30 @@ manettes et le suivi des mains comme controles principaux.
 
 ## Interface minimale
 
-- HUD actuel : panneau spatial devant la manette gauche avec nom du pinceau,
-  barre SIZE verticale et barre POWER horizontale.
-- Menu actuel : panneau spatial outils + SAVE / LOAD / EXPORT / QUIT au meme
-  endroit que le HUD.
-- Le HUD, le menu, la ligne de selection et l'outil main droite sont rendus
-  dans une passe UI transparente separee du shader SDF pour ne plus perturber
-  l'affichage de l'objet.
-- Actions fichier : SAVE/LOAD ecrivent et relisent un fichier SDF local,
-  EXPORT genere un OBJ local, QUIT demande la sortie de la session.
+- HUD actuel : panneau spatial devant la manette gauche avec nom de l'outil en
+  toutes lettres, barres SIZE et POWER horizontales avec valeurs numeriques
+  (cm et %), et rappels des raccourcis (X:UNDO Y:REDO A/B:TOOL).
+- Menu actuel : deux colonnes — 8 outils a gauche, actions SAVE / LOAD /
+  EXPORT / QUIT / AR / MIRROR a droite — et une palette de 8 couleurs
+  (grille 4x2) en bas du panneau. Le panneau reste ainsi compact et toutes
+  les lignes sont faciles a viser.
+- MIRROR : symetrie sur le plan local X=0 visualisee par un disque bleu
+  transparent qui suit l'objet ; chaque stamp est applique des deux cotes,
+  Stretch compris (ancre, delta et rotation miroites, application en couche
+  sans reinitialiser la source).
+- Architecture texte : le panneau entier est peint cote CPU dans une texture
+  RGBA8 264x528 (`HudPainter.h`, police bitmap 5x7, rectangles, contours),
+  re-uploadee uniquement quand l'etat affiche change ; le shader UI ne fait
+  plus qu'echantillonner cette texture sur le plan du panneau. Le layout en
+  pixels est partage entre le dessin et le hit-test C++ du rayon, ce qui
+  garantit que la zone cliquee correspond a la zone affichee (l'ancien code
+  avait un panneau dessine en 0,34 m mais teste en 0,17 m).
+- Le HUD, le menu, la ligne de selection, l'outil main droite et le squelette
+  des mains restent rendus dans une passe UI transparente separee du shader
+  SDF.
+- Actions fichier : SAVE/LOAD ecrivent et relisent un fichier local v2
+  (SDF + volume couleur, retrocompatible v1), EXPORT genere un OBJ local,
+  QUIT demande la sortie de la session.
 
 ## Etapes techniques
 
