@@ -15,6 +15,7 @@ using large::sdf::IVec3;
 using large::sdf::SdfHistory;
 using large::sdf::SdfVolume;
 using large::sdf::Vec3;
+using large::sdf::VoxelBounds;
 using large::sdf::exportSdfSurfaceAsObj;
 using large::sdf::exportSolidVoxelsAsObj;
 
@@ -101,6 +102,43 @@ int main() {
          "pinch should contract material toward the brush center");
   expect(pinchProbe.sample({0.18f, 0.28f, 0.0f}) > pinchFlankBefore,
          "pinch should pull the flanks inward to sharpen the shape");
+
+  // Page-journal history: multiple strokes in different regions undo in
+  // order, and the memory footprint stays proportional to the touched pages.
+  {
+    SdfVolume journalProbe({64, 64, 64}, 0.05f, {-1.6f, -1.6f, -1.6f}, 10.0f);
+    SdfHistory journal(journalProbe);
+    journal.capture();
+    journalProbe.applySphereBrush({-1.0f, -1.0f, -1.0f}, 0.20f, BrushMode::Add);
+    const int afterFirst = journalProbe.countSolidVoxels();
+    journal.capture();
+    journalProbe.applySphereBrush({1.0f, 1.0f, 1.0f}, 0.20f, BrushMode::Add);
+    expect(journal.totalBytes() < journalProbe.values().size() * sizeof(float),
+           "page journal should store far less than full snapshots");
+    expect(journal.undo(), "journal undo second stroke");
+    expect(journalProbe.countSolidVoxels() == afterFirst, "second stroke undone");
+    expect(journal.lastChangedBounds().valid, "undo should report changed bounds");
+    expect(journal.undo(), "journal undo first stroke");
+    expect(journalProbe.countSolidVoxels() == 0, "first stroke undone");
+    expect(journal.redo() && journal.redo(), "journal redo both strokes");
+    expect(journalProbe.countSolidVoxels() > afterFirst, "both strokes redone");
+  }
+
+  // restoreRegion rewinds only the given box from a snapshot.
+  {
+    SdfVolume regionProbe({32, 32, 32}, 0.05f, origin, 10.0f);
+    regionProbe.fillSphere({0.0f, 0.0f, 0.0f}, 0.30f);
+    const SdfVolume snapshot = regionProbe;
+    regionProbe.applySphereBrush({0.0f, 0.0f, 0.0f}, 0.45f, BrushMode::Subtract);  // carve everything
+    expect(regionProbe.countSolidVoxels() < snapshot.countSolidVoxels(), "carve should remove material");
+    VoxelBounds all{};
+    all.valid = true;
+    all.min = {0, 0, 0};
+    all.max = {31, 31, 31};
+    regionProbe.restoreRegion(snapshot, all);
+    expect(regionProbe.countSolidVoxels() == snapshot.countSolidVoxels(),
+           "restoreRegion should bring the snapshot region back");
+  }
 
   SdfVolume colorProbe({8, 8, 8}, 0.1f, {-0.4f, -0.4f, -0.4f}, 10.0f);
   std::vector<std::uint8_t> colors(colorProbe.values().size() * 4, 10);

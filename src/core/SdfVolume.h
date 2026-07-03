@@ -27,6 +27,17 @@ struct VoxelBounds {
   IVec3 max{};
 };
 
+class SdfVolume;
+
+// Notified with the affected voxel bounds right before a brush or restore
+// writes into the volume: lets the undo system snapshot only the touched
+// pages instead of copying the whole volume.
+class SdfEditObserver {
+ public:
+  virtual ~SdfEditObserver() = default;
+  virtual void onBeforeEdit(const SdfVolume& volume, VoxelBounds bounds) = 0;
+};
+
 class SdfVolume {
  public:
   SdfVolume(IVec3 size, float voxelSize, Vec3 origin, float initialDistance);
@@ -83,7 +94,19 @@ class SdfVolume {
   const std::vector<float>& values() const { return values_; }
   void restoreValues(std::vector<float> values);
 
+  // Copies the given region back from `source` (same layout); used by the
+  // stretch tool to rewind only last frame's warp instead of the whole
+  // volume.
+  void restoreRegion(const SdfVolume& source, VoxelBounds bounds);
+
+  // The observer is not part of the volume's value; copies (stretch source
+  // snapshots...) intentionally share it but are only ever read.
+  void setEditObserver(SdfEditObserver* observer) { observer_ = observer; }
+
  private:
+  friend class SdfHistory;
+
+  void notifyBeforeEdit(int minX, int minY, int minZ, int maxX, int maxY, int maxZ);
   void markDirtyVoxel(int x, int y, int z);
   void markDirtyBounds(int minX, int minY, int minZ, int maxX, int maxY, int maxZ);
 
@@ -92,6 +115,7 @@ class SdfVolume {
   Vec3 origin_;
   std::vector<float> values_;
   VoxelBounds dirtyBounds_{};
+  SdfEditObserver* observer_ = nullptr;
 };
 
 }  // namespace large::sdf

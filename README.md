@@ -9,7 +9,11 @@ suivi des mains.
 ## Objectif
 
 - sculpture volumique SDF en temps reel, scene vierge au demarrage ;
-- rendu stereo OpenGL ES par raymarching d'une texture 3D ;
+- volume 256^3 (voxels de 1,9 cm), undo par journal de pages 32^3 avec budget
+  memoire (des dizaines de niveaux), brosses a cout local ;
+- rendu stereo OpenGL ES par raymarching d'une texture 3D, eclairage atelier
+  complet calcule depuis le champ : occlusion ambiante SDF, ombres douces,
+  lumiere d'appoint, speculaire et rim ;
 - outils Add, Subtract, Smooth, Stretch, Flatten (aplatir), Groove (rainure),
   Crease (pincement d'arete) et Paint (peinture volumique avec palette) ;
 - traits continus : les coups de pinceau rapides sont relies par des capsules ;

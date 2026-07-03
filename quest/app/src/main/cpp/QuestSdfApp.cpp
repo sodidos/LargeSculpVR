@@ -205,7 +205,9 @@ void logError(const char* format, ...) {
 }
 
 large::sdf::SdfVolume makeInitialVolume() {
-  constexpr int resolution = 128;
+  // 256^3 over 4.8 m = 1.875 cm voxels (page-journal undo and box-local
+  // brush copies keep the costs proportional to the stroke, not the volume).
+  constexpr int resolution = 256;
   constexpr float extent = 4.8f;
   const float voxelSize = extent / static_cast<float>(resolution);
   const large::sdf::Vec3 origin{-extent * 0.5f, -extent * 0.5f, -extent * 0.5f};
@@ -648,7 +650,10 @@ bool intersectVolumeBounds(const large::sdf::SdfVolume& volume,
 class QuestSdfApp {
  public:
   explicit QuestSdfApp(android_app* app)
-      : app_(app), volume_(makeInitialVolume()), stretchSourceVolume_(volume_), history_(volume_, 12) {}
+      : app_(app),
+        volume_(makeInitialVolume()),
+        stretchSourceVolume_(volume_),
+        history_(volume_, 256ull << 20) {}  // page-journal undo, 256 MB budget
 
   void run() {
     app_->userData = this;
@@ -1904,7 +1909,7 @@ class QuestSdfApp {
     if (undoDown && !undoWasDown_) {
       if (history_.undo()) {
         uploadSdfTexture();
-        markAllColorDirty();
+        colorDirtyBounds_ = mergeVoxelBounds(colorDirtyBounds_, history_.lastChangedBounds());
         uploadColorTexture();
         stretchSourceVolume_ = volume_;
         clearStretchInteraction();
@@ -1918,7 +1923,7 @@ class QuestSdfApp {
     if (redoDown && !redoWasDown_) {
       if (history_.redo()) {
         uploadSdfTexture();
-        markAllColorDirty();
+        colorDirtyBounds_ = mergeVoxelBounds(colorDirtyBounds_, history_.lastChangedBounds());
         uploadColorTexture();
         stretchSourceVolume_ = volume_;
         clearStretchInteraction();
@@ -2018,13 +2023,14 @@ class QuestSdfApp {
       constexpr char magicV2[8] = {'L', 'S', 'D', 'F', 'V', 'R', '2', '\0'};
       const bool isV1 = std::memcmp(magic, magicV1, sizeof(magicV1)) == 0;
       const bool isV2 = std::memcmp(magic, magicV2, sizeof(magicV2)) == 0;
-      const large::sdf::IVec3 size = volume_.size();
-      if ((!isV1 && !isV2) || dims[0] != size.x || dims[1] != size.y ||
-          dims[2] != size.z || valueCount != volume_.values().size()) {
-        throw std::runtime_error("file does not match current volume");
+      if (!isV1 && !isV2) {
+        throw std::runtime_error("unknown file format");
       }
-      if (std::abs(voxelSize - volume_.voxelSize()) > 0.000001f) {
-        throw std::runtime_error("voxel size mismatch");
+      if (dims[0] <= 0 || dims[1] <= 0 || dims[2] <= 0 || dims[0] > 1024 || dims[1] > 1024 || dims[2] > 1024 ||
+          voxelSize <= 0.0f ||
+          valueCount != static_cast<std::uint64_t>(dims[0]) * static_cast<std::uint64_t>(dims[1]) *
+                            static_cast<std::uint64_t>(dims[2])) {
+        throw std::runtime_error("corrupt volume header");
       }
 
       std::vector<float> values(static_cast<std::size_t>(valueCount));
@@ -2042,15 +2048,68 @@ class QuestSdfApp {
         }
       }
 
+      const large::sdf::IVec3 size = volume_.size();
+      const bool sameGrid = dims[0] == size.x && dims[1] == size.y && dims[2] == size.z &&
+                            std::abs(voxelSize - volume_.voxelSize()) < 0.000001f;
+
       history_.capture();
-      volume_.restoreValues(std::move(values));
-      if (isV2) {
-        colorVoxels_ = std::move(colors);
-        markAllColorDirty();
-      } else if (!colorVoxels_.empty()) {
+      if (sameGrid) {
+        volume_.restoreValues(std::move(values));
+        if (isV2) {
+          history_.preserveColorRegion(fullVolumeBounds());
+          colorVoxels_ = std::move(colors);
+        }
+      } else {
+        // Legacy resolution: resample the loaded grid into the current one
+        // (e.g. old 128^3 saves opened in the 256^3 build).
+        const large::sdf::IVec3 loadedSize{dims[0], dims[1], dims[2]};
+        const large::sdf::Vec3 loadedOrigin{originValues[0], originValues[1], originValues[2]};
+        large::sdf::SdfVolume loaded(loadedSize, voxelSize, loadedOrigin, 10.0f);
+        loaded.restoreValues(std::move(values));
+
+        std::vector<float> resampled(volume_.values().size());
+        for (int z = 0; z < size.z; ++z) {
+          for (int y = 0; y < size.y; ++y) {
+            for (int x = 0; x < size.x; ++x) {
+              resampled[volume_.index(x, y, z)] = loaded.sample(volume_.voxelCenter(x, y, z));
+            }
+          }
+        }
+        volume_.restoreValues(std::move(resampled));
+
+        if (isV2 && !colorVoxels_.empty()) {
+          history_.preserveColorRegion(fullVolumeBounds());
+          for (int z = 0; z < size.z; ++z) {
+            for (int y = 0; y < size.y; ++y) {
+              for (int x = 0; x < size.x; ++x) {
+                const large::sdf::Vec3 p = volume_.voxelCenter(x, y, z);
+                const int sx = large::sdf::clampInt(
+                    static_cast<int>(std::floor((p.x - loadedOrigin.x) / voxelSize)), 0, loadedSize.x - 1);
+                const int sy = large::sdf::clampInt(
+                    static_cast<int>(std::floor((p.y - loadedOrigin.y) / voxelSize)), 0, loadedSize.y - 1);
+                const int sz = large::sdf::clampInt(
+                    static_cast<int>(std::floor((p.z - loadedOrigin.z) / voxelSize)), 0, loadedSize.z - 1);
+                const std::size_t from =
+                    (static_cast<std::size_t>(sz) * loadedSize.y + static_cast<std::size_t>(sy)) *
+                        static_cast<std::size_t>(loadedSize.x) +
+                    static_cast<std::size_t>(sx);
+                const std::size_t to = volume_.index(x, y, z);
+                for (int channel = 0; channel < 4; ++channel) {
+                  colorVoxels_[to * 4 + channel] = colors[from * 4 + channel];
+                }
+              }
+            }
+          }
+        }
+        logInfo("Menu LOAD: resampled %dx%dx%d file into %dx%dx%d volume",
+                loadedSize.x, loadedSize.y, loadedSize.z, size.x, size.y, size.z);
+      }
+
+      if (!isV2 && !colorVoxels_.empty()) {
         // v1 files carry no paint: reset the color volume to clay.
         initializeColorVoxels();
       }
+      markAllColorDirty();
       stretchSourceVolume_ = volume_;
       clearStretchInteraction();
       uploadSdfTexture();
@@ -3055,9 +3114,11 @@ class QuestSdfApp {
       case VrTool::Add:
         volume_.applyCapsuleBrush(from, centerLocal, localBrushRadius, large::sdf::BrushMode::Add,
                                   scaledCsgStrength(strength));
-        // Added material comes in the selected paint color (hard edge so the
-        // existing surface around the stroke keeps its own color).
-        applyPaintStroke(from, centerLocal, localBrushRadius, 1.0f, true);
+        // Added material comes in the selected paint color. The paint radius
+        // extends a couple of voxels past the capsule so the air shell around
+        // the new surface is tinted too: the trilinear color filter would
+        // otherwise blend untouched clay into the fresh surface.
+        applyPaintStroke(from, centerLocal, localBrushRadius + volume_.voxelSize() * 2.5f, 1.0f, true);
         break;
       case VrTool::Subtract:
         volume_.applyCapsuleBrush(from, centerLocal, localBrushRadius, large::sdf::BrushMode::Subtract,
@@ -3126,11 +3187,17 @@ class QuestSdfApp {
     history_.attachColors(&colorVoxels_);
   }
 
-  void markAllColorDirty() {
+  large::sdf::VoxelBounds fullVolumeBounds() const {
     const large::sdf::IVec3 size = volume_.size();
-    colorDirtyBounds_.valid = true;
-    colorDirtyBounds_.min = {0, 0, 0};
-    colorDirtyBounds_.max = {size.x - 1, size.y - 1, size.z - 1};
+    large::sdf::VoxelBounds bounds{};
+    bounds.valid = true;
+    bounds.min = {0, 0, 0};
+    bounds.max = {size.x - 1, size.y - 1, size.z - 1};
+    return bounds;
+  }
+
+  void markAllColorDirty() {
+    colorDirtyBounds_ = fullVolumeBounds();
   }
 
   // Blends the paint color into the color volume along a capsule, restricted
@@ -3166,6 +3233,13 @@ class QuestSdfApp {
     const int maxX = large::sdf::clampInt(static_cast<int>(std::ceil((maxPoint.x - origin.x) / voxelSize)), 0, size.x - 1);
     const int maxY = large::sdf::clampInt(static_cast<int>(std::ceil((maxPoint.y - origin.y) / voxelSize)), 0, size.y - 1);
     const int maxZ = large::sdf::clampInt(static_cast<int>(std::ceil((maxPoint.z - origin.z) / voxelSize)), 0, size.z - 1);
+
+    // Preserve the pre-images of the touched color pages for undo.
+    large::sdf::VoxelBounds stampBounds{};
+    stampBounds.valid = true;
+    stampBounds.min = {minX, minY, minZ};
+    stampBounds.max = {maxX, maxY, maxZ};
+    history_.preserveColorRegion(stampBounds);
 
     const large::sdf::Vec3 segment = to - from;
     const float segmentLengthSq = large::sdf::dot(segment, segment);
@@ -3207,10 +3281,6 @@ class QuestSdfApp {
     }
 
     if (painted) {
-      large::sdf::VoxelBounds stampBounds{};
-      stampBounds.valid = true;
-      stampBounds.min = {minX, minY, minZ};
-      stampBounds.max = {maxX, maxY, maxZ};
       colorDirtyBounds_ = mergeVoxelBounds(colorDirtyBounds_, stampBounds);
     }
   }
@@ -3260,6 +3330,9 @@ class QuestSdfApp {
     const bool rotated = rotationAngle * influenceRadius > volume_.voxelSize() * 0.35f;
     if ((moved || rotated) && frameCounter_ >= nextSculptFrame_) {
       const large::sdf::VoxelBounds previousStretchBounds = stretchUploadBounds_;
+      // Rewind only last frame's warp region from the source snapshot, then
+      // re-apply: no more full-volume copy on every stretch frame.
+      volume_.restoreRegion(stretchSourceVolume_, previousStretchBounds);
       volume_.applyStretchBrush(stretchSourceVolume_,
                                 stretchAnchorLocal_,
                                 delta,
@@ -3267,7 +3340,8 @@ class QuestSdfApp {
                                 rotationY,
                                 rotationZ,
                                 influenceRadius,
-                                brushStrength_);
+                                brushStrength_,
+                                false);
       if (mirrorEnabled_) {
         // Mirrored rotation basis: R' = M R M with M = diag(-1, 1, 1).
         volume_.applyStretchBrush(stretchSourceVolume_,
@@ -3452,7 +3526,8 @@ class QuestSdfApp {
     brushHitWorld_ = objectToWorldPoint(brushHitLocal_);
     if (large::sdf::length(delta) > volume_.voxelSize() * 0.35f && frameCounter_ >= nextSculptFrame_) {
       const large::sdf::VoxelBounds previousStretchBounds = stretchUploadBounds_;
-      volume_.applyStretchBrush(stretchSourceVolume_, stretchAnchorLocal_, delta, influenceRadius, 1.0f);
+      volume_.restoreRegion(stretchSourceVolume_, previousStretchBounds);
+      volume_.applyStretchBrush(stretchSourceVolume_, stretchAnchorLocal_, delta, influenceRadius, 1.0f, false);
       if (mirrorEnabled_) {
         volume_.applyStretchBrush(stretchSourceVolume_,
                                   mirrorLocal(stretchAnchorLocal_),
@@ -4350,6 +4425,41 @@ vec3 estimateNormalLocal(vec3 localPoint) {
     sampleSdfLocal(localPoint + dz) - sampleSdfLocal(localPoint - dz)));
 }
 
+// Ambient occlusion from the field itself: samples along the normal at
+// growing distances; concavities read lower values than an open half-space.
+float sdfAmbientOcclusion(vec3 localPoint, vec3 normalLocal) {
+  float occlusion = 0.0;
+  float weight = 1.0;
+  float totalWeight = 0.0;
+  for (int i = 1; i <= 5; ++i) {
+    float reach = uVoxelSize * (0.8 + 1.9 * float(i));
+    float d = sampleSdfLocal(localPoint + normalLocal * reach);
+    occlusion += clamp((reach - d) / reach, 0.0, 1.0) * weight;
+    totalWeight += weight;
+    weight *= 0.65;
+  }
+  return clamp(1.0 - 0.85 * occlusion / totalWeight, 0.0, 1.0);
+}
+
+// Soft shadow: march from the surface toward the light, darkening by how
+// close the ray grazes other geometry.
+float sdfSoftShadow(vec3 localOrigin, vec3 lightDirLocal) {
+  float result = 1.0;
+  float t = uVoxelSize * 2.0;
+  for (int i = 0; i < 20; ++i) {
+    float d = sampleSdfLocal(localOrigin + lightDirLocal * t);
+    result = min(result, 9.0 * d / t);
+    if (result < 0.03) {
+      break;
+    }
+    t += clamp(d, uVoxelSize * 0.75, 0.16);
+    if (t > 2.4) {
+      break;
+    }
+  }
+  return clamp(result, 0.0, 1.0);
+}
+
 float roomLine(float value, float spacing, float width) {
   float cell = abs(fract(value / spacing + 0.5) - 0.5) * spacing;
   return 1.0 - smoothstep(width, width * 2.2, cell);
@@ -4488,7 +4598,7 @@ vec3 shadeUv(vec2 uv, out float sceneDepth, out float sceneAlpha) {
   float previousD = 0.0;
   bool hasPrevious = false;
 
-  for (int i = 0; i < 112; ++i) {
+  for (int i = 0; i < 160; ++i) {
     localP = rayOriginLocal + rayDirLocal * t;
     float d = sampleSdfLocal(localP);
     if (abs(d) < surface) {
@@ -4543,15 +4653,35 @@ vec3 shadeUv(vec2 uv, out float sceneDepth, out float sceneAlpha) {
   sceneDepth = max(t * uObjectScale, 0.0);
   vec3 normalLocal = estimateNormalLocal(localP);
   vec3 normal = normalize(uObjectRotation * normalLocal);
-  vec3 light = normalize(vec3(-0.35, 0.85, 0.42));
-  float diffuse = max(dot(normal, light), 0.0);
-  float wrap = 0.5 + 0.5 * dot(normal, light);
+
   // Sample the paint slightly inside the surface so the trilinear filter
   // does not dilute it with unpainted voxels just outside.
   vec3 colorPoint = localP - normalLocal * (uVoxelSize * 0.6);
   vec3 uvw = clamp((colorPoint - uVolumeMin) / uVolumeExtent, vec3(0.0), vec3(1.0));
   vec3 albedo = texture(uColorVol, uvw).rgb;
-  vec3 color = albedo * (0.35 + diffuse * 0.55 + wrap * 0.10);
+
+  // Studio-style shading straight from the field: key light with SDF soft
+  // shadows, fill light, sky ambient, SDF ambient occlusion, a light
+  // specular and a rim to keep silhouettes readable.
+  vec3 keyDirWorld = normalize(vec3(-0.35, 0.85, 0.42));
+  vec3 keyDirLocal = normalize(uObjectInvRotation * keyDirWorld);
+  float occlusionTerm = sdfAmbientOcclusion(localP, normalLocal);
+  float shadowTerm = sdfSoftShadow(localP + normalLocal * (uVoxelSize * 1.5), keyDirLocal);
+  float keyDiffuse = max(dot(normalLocal, keyDirLocal), 0.0) * shadowTerm;
+
+  vec3 fillDirLocal = normalize(uObjectInvRotation * normalize(vec3(0.55, 0.10, -0.65)));
+  float fillDiffuse = max(dot(normalLocal, fillDirLocal), 0.0);
+
+  float skyAmbient = 0.26 + 0.14 * clamp(normal.y * 0.5 + 0.5, 0.0, 1.0);
+
+  vec3 viewLocal = -rayDirLocal;
+  vec3 halfVector = normalize(keyDirLocal + viewLocal);
+  float specular = pow(max(dot(normalLocal, halfVector), 0.0), 42.0) * 0.28 * shadowTerm * occlusionTerm;
+
+  float rim = pow(1.0 - max(dot(normal, -rayDir), 0.0), 3.0) * 0.10 * occlusionTerm;
+
+  vec3 color = albedo * (skyAmbient * occlusionTerm + keyDiffuse * 0.80 + fillDiffuse * 0.16 * occlusionTerm) +
+               vec3(specular) + rim * vec3(0.75, 0.85, 1.0);
   return color;
 }
 

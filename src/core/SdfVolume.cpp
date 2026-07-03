@@ -13,16 +13,6 @@ float smoothstep(float edge0, float edge1, float x) {
   return t * t * (3.0f - 2.0f * t);
 }
 
-float sourceValue(const std::vector<float>& values, IVec3 size, float fallback, int x, int y, int z) {
-  if (x < 0 || y < 0 || z < 0 || x >= size.x || y >= size.y || z >= size.z) {
-    return fallback;
-  }
-  const std::size_t i = static_cast<std::size_t>(x) +
-                        static_cast<std::size_t>(size.x) *
-                            (static_cast<std::size_t>(y) + static_cast<std::size_t>(size.y) * static_cast<std::size_t>(z));
-  return values[i];
-}
-
 Vec3 inverseRotate(Vec3 v, Vec3 rotationX, Vec3 rotationY, Vec3 rotationZ) {
   return {
       dot(v, rotationX),
@@ -126,7 +116,19 @@ float SdfVolume::worldExtent() const {
   return static_cast<float>(size_.x) * voxelSize_;
 }
 
+void SdfVolume::notifyBeforeEdit(int minX, int minY, int minZ, int maxX, int maxY, int maxZ) {
+  if (observer_ == nullptr) {
+    return;
+  }
+  VoxelBounds bounds{};
+  bounds.valid = true;
+  bounds.min = {clampInt(minX, 0, size_.x - 1), clampInt(minY, 0, size_.y - 1), clampInt(minZ, 0, size_.z - 1)};
+  bounds.max = {clampInt(maxX, 0, size_.x - 1), clampInt(maxY, 0, size_.y - 1), clampInt(maxZ, 0, size_.z - 1)};
+  observer_->onBeforeEdit(*this, bounds);
+}
+
 void SdfVolume::fillSphere(Vec3 center, float radius) {
+  notifyBeforeEdit(0, 0, 0, size_.x - 1, size_.y - 1, size_.z - 1);
   for (int z = 0; z < size_.z; ++z) {
     for (int y = 0; y < size_.y; ++y) {
       for (int x = 0; x < size_.x; ++x) {
@@ -165,6 +167,7 @@ void SdfVolume::applySphereBrush(Vec3 center, float radius, BrushMode mode, floa
   // smooth. Partial strengths blend within a narrow band (soft feel, slightly
   // less exact field).
   const bool exact = amount >= 0.999f;
+  notifyBeforeEdit(minX, minY, minZ, maxX, maxY, maxZ);
 
   for (int z = minZ; z <= maxZ; ++z) {
     for (int y = minY; y <= maxY; ++y) {
@@ -226,6 +229,7 @@ void SdfVolume::applyCapsuleBrush(Vec3 start, Vec3 end, float radius, BrushMode 
   const int maxZ = clampInt(static_cast<int>(std::ceil((maxPoint.z - origin_.z) / voxelSize_)), 0, size_.z - 1);
 
   const bool exact = amount >= 0.999f;
+  notifyBeforeEdit(minX, minY, minZ, maxX, maxY, maxZ);
 
   for (int z = minZ; z <= maxZ; ++z) {
     for (int y = minY; y <= maxY; ++y) {
@@ -272,6 +276,7 @@ void SdfVolume::applyFlattenBrush(Vec3 center, Vec3 planePoint, Vec3 planeNormal
   const int maxY = clampInt(static_cast<int>(std::ceil((center.y + radius - origin_.y) / voxelSize_)), 0, size_.y - 1);
   const int maxZ = clampInt(static_cast<int>(std::ceil((center.z + radius - origin_.z) / voxelSize_)), 0, size_.z - 1);
 
+  notifyBeforeEdit(minX, minY, minZ, maxX, maxY, maxZ);
   for (int z = minZ; z <= maxZ; ++z) {
     for (int y = minY; y <= maxY; ++y) {
       for (int x = minX; x <= maxX; ++x) {
@@ -300,10 +305,6 @@ void SdfVolume::applyPinchBrush(Vec3 center, float radius, float strength) {
   }
 
   const float amount = clamp(strength, 0.0f, 1.0f);
-  // Resample the field from positions pushed away from the brush center, so
-  // the local geometry contracts toward it: edges under the stroke sharpen
-  // into a crease (Medium-style pinch).
-  const SdfVolume source = *this;
 
   const int minX = clampInt(static_cast<int>(std::floor((center.x - radius - origin_.x) / voxelSize_)), 0, size_.x - 1);
   const int minY = clampInt(static_cast<int>(std::floor((center.y - radius - origin_.y) / voxelSize_)), 0, size_.y - 1);
@@ -312,6 +313,34 @@ void SdfVolume::applyPinchBrush(Vec3 center, float radius, float strength) {
   const int maxY = clampInt(static_cast<int>(std::ceil((center.y + radius - origin_.y) / voxelSize_)), 0, size_.y - 1);
   const int maxZ = clampInt(static_cast<int>(std::ceil((center.z + radius - origin_.z) / voxelSize_)), 0, size_.z - 1);
 
+  // Resample the field from positions pushed away from the brush center, so
+  // the local geometry contracts toward it: edges under the stroke sharpen
+  // into a crease (Medium-style pinch). The source copy is local to the
+  // brush region (with a margin covering the outward sampling reach) instead
+  // of duplicating the whole volume.
+  const int margin = static_cast<int>(std::ceil(radius * 0.5f / voxelSize_)) + 2;
+  const int srcMinX = clampInt(minX - margin, 0, size_.x - 1);
+  const int srcMinY = clampInt(minY - margin, 0, size_.y - 1);
+  const int srcMinZ = clampInt(minZ - margin, 0, size_.z - 1);
+  const int srcMaxX = clampInt(maxX + margin, 0, size_.x - 1);
+  const int srcMaxY = clampInt(maxY + margin, 0, size_.y - 1);
+  const int srcMaxZ = clampInt(maxZ + margin, 0, size_.z - 1);
+  const IVec3 sourceSize{srcMaxX - srcMinX + 1, srcMaxY - srcMinY + 1, srcMaxZ - srcMinZ + 1};
+  const Vec3 sourceOrigin{
+      origin_.x + static_cast<float>(srcMinX) * voxelSize_,
+      origin_.y + static_cast<float>(srcMinY) * voxelSize_,
+      origin_.z + static_cast<float>(srcMinZ) * voxelSize_,
+  };
+  SdfVolume source(sourceSize, voxelSize_, sourceOrigin, voxelSize_ * 16.0f);
+  for (int z = 0; z < sourceSize.z; ++z) {
+    for (int y = 0; y < sourceSize.y; ++y) {
+      const std::size_t from = index(srcMinX, srcMinY + y, srcMinZ + z);
+      const std::size_t to = source.index(0, y, z);
+      std::copy_n(values_.data() + from, static_cast<std::size_t>(sourceSize.x), source.values_.data() + to);
+    }
+  }
+
+  notifyBeforeEdit(minX, minY, minZ, maxX, maxY, maxZ);
   for (int z = minZ; z <= maxZ; ++z) {
     for (int y = minY; y <= maxY; ++y) {
       for (int x = minX; x <= maxX; ++x) {
@@ -340,7 +369,6 @@ void SdfVolume::applySmoothBrush(Vec3 center, float radius, float strength) {
   if (amount <= 0.0f) {
     return;
   }
-  const auto source = values_;
 
   const int minX = clampInt(static_cast<int>(std::floor((center.x - radius - origin_.x) / voxelSize_)), 0, size_.x - 1);
   const int minY = clampInt(static_cast<int>(std::floor((center.y - radius - origin_.y) / voxelSize_)), 0, size_.y - 1);
@@ -349,6 +377,38 @@ void SdfVolume::applySmoothBrush(Vec3 center, float radius, float strength) {
   const int maxY = clampInt(static_cast<int>(std::ceil((center.y + radius - origin_.y) / voxelSize_)), 0, size_.y - 1);
   const int maxZ = clampInt(static_cast<int>(std::ceil((center.z + radius - origin_.z) / voxelSize_)), 0, size_.z - 1);
 
+  // Copy only the brush region (with a one-voxel margin for the neighbor
+  // reads) instead of the whole volume.
+  const int srcMinX = clampInt(minX - 1, 0, size_.x - 1);
+  const int srcMinY = clampInt(minY - 1, 0, size_.y - 1);
+  const int srcMinZ = clampInt(minZ - 1, 0, size_.z - 1);
+  const int srcMaxX = clampInt(maxX + 1, 0, size_.x - 1);
+  const int srcMaxY = clampInt(maxY + 1, 0, size_.y - 1);
+  const int srcMaxZ = clampInt(maxZ + 1, 0, size_.z - 1);
+  const IVec3 regionSize{srcMaxX - srcMinX + 1, srcMaxY - srcMinY + 1, srcMaxZ - srcMinZ + 1};
+  std::vector<float> region(static_cast<std::size_t>(regionSize.x) * static_cast<std::size_t>(regionSize.y) *
+                            static_cast<std::size_t>(regionSize.z));
+  for (int z = 0; z < regionSize.z; ++z) {
+    for (int y = 0; y < regionSize.y; ++y) {
+      const std::size_t from = index(srcMinX, srcMinY + y, srcMinZ + z);
+      const std::size_t to = (static_cast<std::size_t>(z) * static_cast<std::size_t>(regionSize.y) +
+                              static_cast<std::size_t>(y)) *
+                             static_cast<std::size_t>(regionSize.x);
+      std::copy_n(values_.data() + from, static_cast<std::size_t>(regionSize.x), region.data() + to);
+    }
+  }
+  const auto regionValue = [&](int x, int y, int z, float fallback) {
+    if (x < srcMinX || y < srcMinY || z < srcMinZ || x > srcMaxX || y > srcMaxY || z > srcMaxZ) {
+      return fallback;
+    }
+    const std::size_t i = (static_cast<std::size_t>(z - srcMinZ) * static_cast<std::size_t>(regionSize.y) +
+                           static_cast<std::size_t>(y - srcMinY)) *
+                              static_cast<std::size_t>(regionSize.x) +
+                          static_cast<std::size_t>(x - srcMinX);
+    return region[i];
+  };
+
+  notifyBeforeEdit(minX, minY, minZ, maxX, maxY, maxZ);
   for (int z = minZ; z <= maxZ; ++z) {
     for (int y = minY; y <= maxY; ++y) {
       for (int x = minX; x <= maxX; ++x) {
@@ -362,14 +422,14 @@ void SdfVolume::applySmoothBrush(Vec3 center, float radius, float strength) {
         // instead of smoothing it near the borders of the sculpted region.
         const float band = voxelSize_ * 4.0f;
         const std::size_t i = index(x, y, z);
-        const float original = clamp(source[i], -band, band);
+        const float original = clamp(regionValue(x, y, z, 0.0f), -band, band);
         const float average =
-            (clamp(sourceValue(source, size_, original, x - 1, y, z), -band, band) +
-             clamp(sourceValue(source, size_, original, x + 1, y, z), -band, band) +
-             clamp(sourceValue(source, size_, original, x, y - 1, z), -band, band) +
-             clamp(sourceValue(source, size_, original, x, y + 1, z), -band, band) +
-             clamp(sourceValue(source, size_, original, x, y, z - 1), -band, band) +
-             clamp(sourceValue(source, size_, original, x, y, z + 1), -band, band)) /
+            (clamp(regionValue(x - 1, y, z, original), -band, band) +
+             clamp(regionValue(x + 1, y, z, original), -band, band) +
+             clamp(regionValue(x, y - 1, z, original), -band, band) +
+             clamp(regionValue(x, y + 1, z, original), -band, band) +
+             clamp(regionValue(x, y, z - 1, original), -band, band) +
+             clamp(regionValue(x, y, z + 1, original), -band, band)) /
             6.0f;
         const float falloff = 1.0f - smoothstep(0.0f, 1.0f, dist / radius);
         values_[i] = original + (average - original) * amount * falloff;
@@ -414,6 +474,7 @@ void SdfVolume::applyStretchBrush(const SdfVolume& source,
   }
 
   if (resetToSource) {
+    notifyBeforeEdit(0, 0, 0, size_.x - 1, size_.y - 1, size_.z - 1);
     values_ = source.values_;
   }
 
@@ -463,6 +524,7 @@ void SdfVolume::applyStretchBrush(const SdfVolume& source,
     return radial * axial;
   };
 
+  notifyBeforeEdit(minX, minY, minZ, maxX, maxY, maxZ);
   for (int z = minZ; z <= maxZ; ++z) {
     for (int y = minY; y <= maxY; ++y) {
       for (int x = minX; x <= maxX; ++x) {
@@ -567,8 +629,35 @@ void SdfVolume::restoreValues(std::vector<float> values) {
   if (values.size() != values_.size()) {
     throw std::invalid_argument("SdfVolume snapshot size mismatch");
   }
+  notifyBeforeEdit(0, 0, 0, size_.x - 1, size_.y - 1, size_.z - 1);
   values_ = std::move(values);
   markAllDirty();
+}
+
+void SdfVolume::restoreRegion(const SdfVolume& source, VoxelBounds bounds) {
+  if (!bounds.valid) {
+    return;
+  }
+  if (source.size_.x != size_.x || source.size_.y != size_.y || source.size_.z != size_.z) {
+    throw std::invalid_argument("SdfVolume restore source must match destination volume");
+  }
+
+  const int minX = clampInt(bounds.min.x, 0, size_.x - 1);
+  const int minY = clampInt(bounds.min.y, 0, size_.y - 1);
+  const int minZ = clampInt(bounds.min.z, 0, size_.z - 1);
+  const int maxX = clampInt(bounds.max.x, minX, size_.x - 1);
+  const int maxY = clampInt(bounds.max.y, minY, size_.y - 1);
+  const int maxZ = clampInt(bounds.max.z, minZ, size_.z - 1);
+
+  notifyBeforeEdit(minX, minY, minZ, maxX, maxY, maxZ);
+  const std::size_t rowLength = static_cast<std::size_t>(maxX - minX + 1);
+  for (int z = minZ; z <= maxZ; ++z) {
+    for (int y = minY; y <= maxY; ++y) {
+      const std::size_t i = index(minX, y, z);
+      std::copy_n(source.values_.data() + i, rowLength, values_.data() + i);
+    }
+  }
+  markDirtyBounds(minX, minY, minZ, maxX, maxY, maxZ);
 }
 
 void SdfVolume::clearDirtyBounds() {
