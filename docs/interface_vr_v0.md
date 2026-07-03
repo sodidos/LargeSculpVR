@@ -102,10 +102,24 @@ manettes et le suivi des mains comme controles principaux.
 - HUD actuel : panneau spatial devant la manette gauche avec nom de l'outil en
   toutes lettres, barres SIZE et POWER horizontales avec valeurs numeriques
   (cm et %), et rappels des raccourcis (X:UNDO Y:REDO A/B:TOOL).
-- Menu actuel : deux colonnes — 8 outils a gauche, actions SAVE / LOAD /
-  EXPORT / QUIT / AR / MIRROR a droite — et une palette de 8 couleurs
-  (grille 4x2) en bas du panneau. Le panneau reste ainsi compact et toutes
-  les lignes sont faciles a viser.
+- Menu actuel : panneau opaque a 4 pages avec onglets (OUTILS / FICHIERS /
+  COULEUR / PINCEAU), gros boutons arrondis adaptes au doigt comme au rayon
+  manette. OUTILS = grille 2x4 de boutons icone+nom ; FICHIERS = SAVE / LOAD /
+  EXPORT / AR / LOCK / EXIT pleine largeur ; COULEUR = selecteur TSV (carre
+  saturation/valeur + barre de teinte, glisser pour regler) ; PINCEAU =
+  sliders TAILLE et FORCE + bouton MIROIR + apercu du rayon.
+- Ancrage : le panneau est ancre a la base du poignet gauche (articulation
+  poignet en suivi des mains, pose grip en manette) et grandit vers le haut ;
+  l'ancre est lissee pour ne pas trembler avec les doigts.
+- Interaction mains : le panneau se touche comme un ecran tactile avec
+  l'index droit. La projection du doigt sur le panneau sert de survol (court
+  faisceau + point d'impact), le contact avec la surface declenche le clic,
+  et garder le contact fait glisser les sliders / le selecteur de couleur.
+  Pas de pincement necessaire. La sculpture est suspendue tant que le doigt
+  est dans la zone du panneau.
+- Le repere du panneau (right/up/forward) est calcule une fois cote CPU et
+  transmis au shader : le plan affiche et le plan clique sont identiques,
+  sans decalage vers les bords.
 - MIRROR : symetrie sur le plan local X=0 visualisee par un disque bleu
   transparent qui suit l'objet ; chaque stamp est applique des deux cotes,
   Stretch compris (ancre, delta et rotation miroites, application en couche

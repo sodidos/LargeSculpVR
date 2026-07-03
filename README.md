@@ -49,8 +49,12 @@ autorise.
   ce qui permet de creer la premiere matiere dans la scene vierge) ;
 - A/B : outil suivant / precedent (Add, Subtract, Smooth, Stretch, Flatten,
   Groove, Crease, Paint) ;
-- joystick gauche horizontal : intensite de l'outil actif ;
-- joystick gauche vertical : taille de l'outil actif ;
+- joystick droit horizontal : intensite de l'outil actif ;
+- joystick droit vertical : taille de l'outil actif ; la taille est relative
+  a l'objet (elle suit le zoom : meme fraction de la sculpture quel que soit
+  l'agrandissement) ; deux arcs (cyan = taille, orange = force) apparaissent
+  autour de la pointe de l'outil pendant le reglage ;
+- joystick gauche : deplacement dans le decor ;
 - X/Y : undo / redo (sculpture et peinture) ;
 - bouton menu gauche : menu en deux colonnes (outils a gauche, actions SAVE /
   LOAD / EXPORT / QUIT / AR / MIRROR a droite) + palette de 8 couleurs de
@@ -60,8 +64,7 @@ autorise.
   transparent ;
 - LOCK : fige la position, la rotation et l'echelle de l'objet (les grips et
   le pincement-zoom sont ignores tant que le verrou est actif) ;
-- joystick droit : deplacement dans le decor (avant/arriere et lateral,
-  relatif au regard) ; en mode AR seul l'objet semble se deplacer ;
+- en mode AR seul l'objet semble se deplacer pendant la locomotion ;
 - EXPORT publie l'OBJ dans `Documents/LargeSculpVR/sculpt_<date>.obj`,
   visible dans le gestionnaire de fichiers du Quest et par USB ;
 - AR : passthrough compose sous la scene, le fond devient transparent et la
@@ -80,7 +83,18 @@ autorise.
   d'outil ; les gestes ont une hysteresis et les positions sont lissees ;
 - menu aux mains : bouton MENU dans l'en-tete du panneau du poignet gauche,
   et appui direct de l'index droit sur le panneau pour survoler et cliquer
-  (la sculpture est suspendue quand le doigt est dans la zone du panneau).
+  (la sculpture est suspendue quand le doigt est dans la zone du panneau) ;
+- anti-declenchement : les gestes mains (pincement sculpteur, poing/main
+  ouverte, poing gauche de grab) doivent etre tenus ~0,2 s avant d'agir ;
+  l'armement est annonce par un bourdonnement grave continu termine par un
+  pop aigu de validation ;
+- mains : la droite n'affiche que pouce et index (fins, noir opaque, pastille
+  couleur outil au bout de l'index) ; la gauche n'apparait que lorsqu'elle
+  agit (poing ou pincement) ;
+- menu ferme : un simple bouton rond MENU au-dessus du poignet gauche ;
+- Add depose la matiere dans la couleur de peinture choisie ;
+- retour sonore synthetise (AAudio) : clic menu, changement d'outil, debut de
+  trait, grab, undo/redo, save/load/export.
 
 La scene VR inclut une piece vide fixe en arriere-plan pour donner un repere
 stable pendant la manipulation de l'objet.

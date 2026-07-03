@@ -49,6 +49,7 @@ target_link_libraries(large_quest_sdf PRIVATE
     log
     EGL
     GLESv3
+    aaudio
 )
 
 if(LARGE_USE_OPENXR)

@@ -27,6 +27,7 @@
 #include "core/ObjExporter.h"
 #include "core/SurfaceMesh.h"
 
+#include "AudioFeedback.h"
 #include "HudPainter.h"
 
 #if LARGE_USE_OPENXR
@@ -65,30 +66,53 @@ constexpr float kHandClapDistance = 0.115f;
 constexpr float kHandClapReleaseDistance = 0.195f;
 constexpr float kHandPinchZoomSpeed = 3.0f;
 constexpr float kControllerToolLength = 0.20f;
+// Arm delay: hand gestures must be held briefly before they act, so a stray
+// pinch or relaxed fist does not sculpt or move the scene by accident. The
+// arming is announced by a low sustained buzz, ended by a high pop.
+constexpr std::uint64_t kHandArmFrames = 14;  // ~0.2 s at 72 Hz
+constexpr float kHandArmSeconds = static_cast<float>(kHandArmFrames) / 72.0f;
 constexpr float kHandSmoothStrength = 1.0f;
 constexpr float kHandEraseStrength = 1.0f;
-constexpr int kMenuToolCount = 8;
-constexpr int kMenuFileActionCount = 4;
-constexpr int kMenuArChoice = kMenuToolCount + kMenuFileActionCount;  // AR toggle row
-constexpr int kMenuMirrorChoice = kMenuArChoice + 1;                  // symmetry toggle row
-constexpr int kMenuLockChoice = kMenuMirrorChoice + 1;                // freeze object pose/scale
-constexpr int kMenuPaletteFirstChoice = kMenuLockChoice + 1;          // 8 paint color swatches
-constexpr int kMenuToggleChoice = 99;                                 // MENU header button
-static_assert(kMenuToolCount == large::hud::kMenuToolRowCount, "tool rows must match HUD layout");
-static_assert(kMenuFileActionCount + 3 == large::hud::kMenuActionRowCount,
-              "action rows must match HUD layout");
+// Menu control ids, shared between hit-testing, interaction and painting.
+constexpr int kChoiceToolFirst = 0;  // 0..7: the eight tools
+constexpr int kChoiceTabFirst = 10;  // 10..13: the four menu pages
+constexpr int kChoiceSave = 20;
+constexpr int kChoiceLoad = 21;
+constexpr int kChoiceExport = 22;
+constexpr int kChoiceAr = 23;
+constexpr int kChoiceLock = 24;
+constexpr int kChoiceExit = 25;
+constexpr int kChoiceSvArea = 30;      // drag: saturation/value square
+constexpr int kChoiceHueBar = 31;      // drag: hue bar
+constexpr int kChoiceSizeSlider = 40;  // drag: brush radius
+constexpr int kChoicePowerSlider = 41; // drag: brush strength
+constexpr int kChoiceMirror = 42;
+constexpr int kChoiceMenuToggle = 99;  // MENU header button
 
-// Paint palette (linear RGB); entry 0 is the default clay used to clear the color volume.
-constexpr std::array<std::array<float, 3>, large::hud::kPaletteCount> kPaintPalette{{
-    {0.86f, 0.68f, 0.54f},  // clay
-    {0.93f, 0.93f, 0.93f},  // white
-    {0.25f, 0.25f, 0.28f},  // graphite
-    {0.84f, 0.19f, 0.19f},  // red
-    {1.00f, 0.62f, 0.10f},  // orange
-    {1.00f, 0.87f, 0.35f},  // yellow
-    {0.18f, 0.80f, 0.44f},  // green
-    {0.20f, 0.60f, 0.86f},  // blue
-}};
+constexpr int kMenuPageTools = 0;
+constexpr int kMenuPageFiles = 1;
+constexpr int kMenuPageColor = 2;
+constexpr int kMenuPageBrush = 3;
+
+// Default clay used to clear the color volume.
+constexpr std::array<float, 3> kClayColor{0.86f, 0.68f, 0.54f};
+
+large::sdf::Vec3 hsvToRgb(float hue, float saturation, float value) {
+  const float h = (hue - std::floor(hue)) * 6.0f;
+  const int sector = static_cast<int>(h) % 6;
+  const float f = h - std::floor(h);
+  const float p = value * (1.0f - saturation);
+  const float q = value * (1.0f - saturation * f);
+  const float t = value * (1.0f - saturation * (1.0f - f));
+  switch (sector) {
+    case 0: return {value, t, p};
+    case 1: return {q, value, p};
+    case 2: return {p, value, t};
+    case 3: return {p, q, value};
+    case 4: return {t, p, value};
+    default: return {value, p, q};
+  }
+}
 
 enum class VrTool {
   Add,
@@ -636,6 +660,11 @@ class QuestSdfApp {
             volume_.size().y,
             volume_.size().z);
     stretchSourceVolume_ = volume_;
+    if (audio_.initialize()) {
+      logInfo("Audio feedback ready");
+    } else {
+      logError("Audio feedback unavailable");
+    }
 
 #if LARGE_USE_OPENXR
     openXrReady_ = initializeOpenXr();
@@ -666,6 +695,7 @@ class QuestSdfApp {
 #if LARGE_USE_OPENXR
     shutdownOpenXr();
 #endif
+    audio_.shutdown();
   }
 
  private:
@@ -1252,28 +1282,30 @@ class QuestSdfApp {
       return false;
     }
 
-    XrActionCreateInfo leftStickInfo{};
-    leftStickInfo.type = XR_TYPE_ACTION_CREATE_INFO;
-    leftStickInfo.actionType = XR_ACTION_TYPE_VECTOR2F_INPUT;
-    std::strncpy(leftStickInfo.actionName, "brush_adjust", XR_MAX_ACTION_NAME_SIZE - 1);
-    std::strncpy(leftStickInfo.localizedActionName, "Brush Adjust", XR_MAX_LOCALIZED_ACTION_NAME_SIZE - 1);
-    leftStickInfo.countSubactionPaths = 1;
-    leftStickInfo.subactionPaths = &leftHandPath_;
+    // Brush adjust lives on the RIGHT stick (the sculpting hand tunes its own
+    // tool) and locomotion on the LEFT stick.
+    XrActionCreateInfo rightStickInfo{};
+    rightStickInfo.type = XR_TYPE_ACTION_CREATE_INFO;
+    rightStickInfo.actionType = XR_ACTION_TYPE_VECTOR2F_INPUT;
+    std::strncpy(rightStickInfo.actionName, "brush_adjust", XR_MAX_ACTION_NAME_SIZE - 1);
+    std::strncpy(rightStickInfo.localizedActionName, "Brush Adjust", XR_MAX_LOCALIZED_ACTION_NAME_SIZE - 1);
+    rightStickInfo.countSubactionPaths = 1;
+    rightStickInfo.subactionPaths = &rightHandPath_;
     if (!checkXr(xrInstance_,
-                 xrCreateAction(actionSet_, &leftStickInfo, &brushAdjustAction_),
+                 xrCreateAction(actionSet_, &rightStickInfo, &brushAdjustAction_),
                  "xrCreateAction(brush adjust)")) {
       return false;
     }
 
-    XrActionCreateInfo rightStickInfo{};
-    rightStickInfo.type = XR_TYPE_ACTION_CREATE_INFO;
-    rightStickInfo.actionType = XR_ACTION_TYPE_VECTOR2F_INPUT;
-    std::strncpy(rightStickInfo.actionName, "locomotion", XR_MAX_ACTION_NAME_SIZE - 1);
-    std::strncpy(rightStickInfo.localizedActionName, "Locomotion", XR_MAX_LOCALIZED_ACTION_NAME_SIZE - 1);
-    rightStickInfo.countSubactionPaths = 1;
-    rightStickInfo.subactionPaths = &rightHandPath_;
+    XrActionCreateInfo leftStickInfo{};
+    leftStickInfo.type = XR_TYPE_ACTION_CREATE_INFO;
+    leftStickInfo.actionType = XR_ACTION_TYPE_VECTOR2F_INPUT;
+    std::strncpy(leftStickInfo.actionName, "locomotion", XR_MAX_ACTION_NAME_SIZE - 1);
+    std::strncpy(leftStickInfo.localizedActionName, "Locomotion", XR_MAX_LOCALIZED_ACTION_NAME_SIZE - 1);
+    leftStickInfo.countSubactionPaths = 1;
+    leftStickInfo.subactionPaths = &leftHandPath_;
     if (!checkXr(xrInstance_,
-                 xrCreateAction(actionSet_, &rightStickInfo, &locomotionAction_),
+                 xrCreateAction(actionSet_, &leftStickInfo, &locomotionAction_),
                  "xrCreateAction(locomotion)")) {
       return false;
     }
@@ -1379,8 +1411,8 @@ class QuestSdfApp {
     std::array<XrActionSuggestedBinding, 13> bindings{{
         {gripPoseAction_, leftGripPosePath},
         {gripValueAction_, leftGripValuePath},
-        {brushAdjustAction_, leftStickPath},
-        {locomotionAction_, rightStickPath},
+        {brushAdjustAction_, rightStickPath},
+        {locomotionAction_, leftStickPath},
         {undoAction_, leftXPath},
         {redoAction_, leftYPath},
         {menuAction_, leftMenuPath},
@@ -1823,6 +1855,7 @@ class QuestSdfApp {
   }
 
   void setActiveTool(VrTool tool, const char* source) {
+    audio_.play(700.0f, 0.05f, 0.20f);
     storeActiveToolSettings();
     activeTool_ = tool;
     loadActiveToolSettings();
@@ -1835,7 +1868,7 @@ class QuestSdfApp {
   }
 
   void updateBrushAdjustments() {
-    leftStickValue_ = readVector2Action(brushAdjustAction_, leftHandPath_, "brush adjust");
+    leftStickValue_ = readVector2Action(brushAdjustAction_, rightHandPath_, "brush adjust");
     constexpr float deadzone = 0.18f;
     bool changed = false;
 
@@ -1859,6 +1892,7 @@ class QuestSdfApp {
     }
     if (changed) {
       storeActiveToolSettings();
+      lastBrushAdjustFrame_ = frameCounter_;
     }
   }
 
@@ -1874,6 +1908,7 @@ class QuestSdfApp {
         uploadColorTexture();
         stretchSourceVolume_ = volume_;
         clearStretchInteraction();
+        audio_.play(480.0f, 0.07f, 0.20f);
         logInfo("Undo sculpt");
       } else {
         logInfo("Undo sculpt: no snapshot");
@@ -1887,6 +1922,7 @@ class QuestSdfApp {
         uploadColorTexture();
         stretchSourceVolume_ = volume_;
         clearStretchInteraction();
+        audio_.play(640.0f, 0.07f, 0.20f);
         logInfo("Redo sculpt");
       } else {
         logInfo("Redo sculpt: no snapshot");
@@ -1951,6 +1987,7 @@ class QuestSdfApp {
       if (!out) {
         throw std::runtime_error("write failed");
       }
+      audio_.play(880.0f, 0.12f, 0.22f);
       logInfo("Menu SAVE: %s", path.string().c_str());
     } catch (const std::exception& e) {
       logError("Menu SAVE failed: %s", e.what());
@@ -2018,6 +2055,7 @@ class QuestSdfApp {
       clearStretchInteraction();
       uploadSdfTexture();
       uploadColorTexture();
+      audio_.play(880.0f, 0.12f, 0.22f);
       logInfo("Menu LOAD: %s (%s)", path.string().c_str(), isV2 ? "v2" : "v1");
     } catch (const std::exception& e) {
       logError("Menu LOAD failed: %s", e.what());
@@ -2150,6 +2188,7 @@ class QuestSdfApp {
       const std::filesystem::path path = appDataPath() / fileName;
       const large::sdf::ObjExportStats stats = large::sdf::exportSdfSurfaceAsObj(
           volume_, path, colorVoxels_.empty() ? nullptr : colorVoxels_.data());
+      audio_.play(880.0f, 0.12f, 0.22f);
       if (publishFileToDocuments(path, fileName)) {
         logInfo("Menu EXPORT: Documents/LargeSculpVR/%s, vertices=%d faces=%d (vertex colors)",
                 fileName,
@@ -2167,52 +2206,47 @@ class QuestSdfApp {
   }
 
   void activateMenuChoice(int choice) {
-    if (choice == kMenuToggleChoice) {
+    audio_.play(1250.0f, 0.035f, 0.22f);
+    if (choice == kChoiceMenuToggle) {
       menuVisible_ = !menuVisible_;
       logInfo("Menu %s via panel button", menuVisible_ ? "opened" : "closed");
       return;
     }
 
-    if (choice == kMenuArChoice) {
-      setArModeEnabled(!arModeEnabled_);
+    if (choice >= kChoiceTabFirst && choice < kChoiceTabFirst + large::hud::kTabCount) {
+      menuPage_ = choice - kChoiceTabFirst;
+      logInfo("Menu page %d", menuPage_);
       return;
     }
 
-    if (choice == kMenuMirrorChoice) {
-      mirrorEnabled_ = !mirrorEnabled_;
-      logInfo("Mirror mode %s", mirrorEnabled_ ? "enabled" : "disabled");
-      return;
-    }
-
-    if (choice == kMenuLockChoice) {
-      objectLocked_ = !objectLocked_;
-      logInfo("Object lock %s", objectLocked_ ? "enabled" : "disabled");
-      return;
-    }
-
-    if (choice >= kMenuPaletteFirstChoice && choice < kMenuPaletteFirstChoice + large::hud::kPaletteCount) {
-      paintColorIndex_ = choice - kMenuPaletteFirstChoice;
-      setActiveTool(VrTool::Paint, "Menu palette");
-      return;
-    }
-
-    if (choice >= 0 && choice < kMenuToolCount) {
-      setActiveTool(toolFromIndex(choice), "Menu");
+    if (choice >= kChoiceToolFirst && choice < kChoiceToolFirst + kVrToolCount) {
+      setActiveTool(toolFromIndex(choice - kChoiceToolFirst), "Menu");
       return;
     }
 
     switch (choice) {
-      case kMenuToolCount + 0:
+      case kChoiceSave:
         saveSdfVolume();
         break;
-      case kMenuToolCount + 1:
+      case kChoiceLoad:
         loadSdfVolume();
         break;
-      case kMenuToolCount + 2:
+      case kChoiceExport:
         exportSdfVolume();
         break;
-      case kMenuToolCount + 3:
-        logInfo("Menu QUIT");
+      case kChoiceAr:
+        setArModeEnabled(!arModeEnabled_);
+        break;
+      case kChoiceLock:
+        objectLocked_ = !objectLocked_;
+        logInfo("Object lock %s", objectLocked_ ? "enabled" : "disabled");
+        break;
+      case kChoiceMirror:
+        mirrorEnabled_ = !mirrorEnabled_;
+        logInfo("Mirror mode %s", mirrorEnabled_ ? "enabled" : "disabled");
+        break;
+      case kChoiceExit:
+        logInfo("Menu EXIT");
         // Ask the runtime to end the session; the state machine then goes
         // STOPPING -> xrEndSession -> EXITING -> activity finish. Forcing
         // destroyRequested here would tear GL/XR down mid-frame and crash.
@@ -2498,34 +2532,20 @@ class QuestSdfApp {
     return {1.0f, 0.0f, 0.0f};
   }
 
-  ControllerPose leftUiPose() const {
-    if (leftGripPose_.active) {
-      return leftGripPose_;
-    }
-    if (leftHandState_.active) {
-      return leftHandState_.pose;
-    }
-    return {};
-  }
-
   bool isLeftUiVisible() const {
-    return leftGripPose_.active || leftHandState_.active;
+    return uiFrameValid_;
   }
 
   large::sdf::Vec3 leftUiPosition() const {
-    const ControllerPose uiPose = leftUiPose();
-    if (!uiPose.active) {
-      return {};
-    }
-    const large::sdf::Vec3 leftForward =
-        large::sdf::normalize(rotateByQuaternion(uiPose.orientation, {0.0f, 0.0f, -1.0f}));
-    return uiPose.position + leftForward * 0.24f;
+    return uiFrame_.center;
   }
 
   struct UiPointerHit {
     large::sdf::Vec3 point{};
     float signedDistance = 0.0f;
     int menuChoice = -1;
+    float fragX = 0.0f;
+    float fragY = 0.0f;
   };
 
   struct UiPanelFrame {
@@ -2537,26 +2557,63 @@ class QuestSdfApp {
     float contentHeight = 0.0f;  // visible pixels (header only, or full menu)
   };
 
-  bool leftUiPanelFrame(UiPanelFrame& frame) const {
-    if (!isLeftUiVisible()) {
-      return false;
+  // The panel is anchored at the base of the left wrist (hand joint or grip
+  // pose) and grows upward from it; the anchor is low-pass filtered so the
+  // panel does not shake with finger motion.
+  void updateLeftUiFrame() {
+    large::sdf::Vec3 anchor{};
+    if (leftHandState_.active) {
+      anchor = leftHandState_.joints[1];  // XR_HAND_JOINT_WRIST_EXT
+    } else if (leftGripPose_.active) {
+      anchor = leftGripPose_.position;
+    } else {
+      uiFrameValid_ = false;
+      uiAnchorValid_ = false;
+      return;
     }
 
-    frame.center = leftUiPosition();
-    const large::sdf::Vec3 head = currentHeadPosition();
-    frame.forward = large::sdf::normalize(head - frame.center);
-    frame.right = large::sdf::cross({0.0f, 1.0f, 0.0f}, frame.forward);
-    if (large::sdf::dot(frame.right, frame.right) < 0.05f) {
-      frame.right = {1.0f, 0.0f, 0.0f};
+    if (!uiAnchorValid_) {
+      smoothedUiAnchor_ = anchor;
+      uiAnchorValid_ = true;
     } else {
-      frame.right = large::sdf::normalize(frame.right);
+      smoothedUiAnchor_ = smoothedUiAnchor_ * 0.70f + anchor * 0.30f;
     }
-    frame.up = large::sdf::normalize(large::sdf::cross(frame.forward, frame.right));
-    frame.contentHeight =
+
+    // The panel stands perfectly vertical: it faces the user horizontally
+    // (head direction projected on the ground plane) with world up.
+    const large::sdf::Vec3 head = currentHeadPosition();
+    large::sdf::Vec3 forward = head - smoothedUiAnchor_;
+    forward.y = 0.0f;
+    if (large::sdf::dot(forward, forward) < 0.0004f) {
+      forward = {0.0f, 0.0f, 1.0f};
+    } else {
+      forward = large::sdf::normalize(forward);
+    }
+    const large::sdf::Vec3 up{0.0f, 1.0f, 0.0f};
+    const large::sdf::Vec3 right = large::sdf::normalize(large::sdf::cross(up, forward));
+
+    uiFrame_.contentHeight =
         static_cast<float>(menuVisible_ ? large::hud::kContentHeight : large::hud::kHeaderVisibleHeight);
-    frame.height = large::hud::kPanelWidthMeters * frame.contentHeight /
-                   static_cast<float>(large::hud::kContentWidth);
+    uiFrame_.height = large::hud::kPanelWidthMeters * uiFrame_.contentHeight /
+                      static_cast<float>(large::hud::kContentWidth);
+    uiFrame_.center = smoothedUiAnchor_ + up * (uiFrame_.height * 0.5f - 0.06f);
+    uiFrame_.forward = forward;
+    uiFrame_.right = right;
+    uiFrame_.up = up;
+    uiFrameValid_ = true;
+  }
+
+  bool leftUiPanelFrame(UiPanelFrame& frame) const {
+    if (!uiFrameValid_) {
+      return false;
+    }
+    frame = uiFrame_;
     return true;
+  }
+
+  static bool inRect(float x, float y, int left, int top, int right, int bottom) {
+    return x >= static_cast<float>(left) && x <= static_cast<float>(right) && y >= static_cast<float>(top) &&
+           y <= static_cast<float>(bottom);
   }
 
   bool resolveLeftUiHit(const UiPanelFrame& frame, large::sdf::Vec3 point, UiPointerHit& hit) const {
@@ -2575,51 +2632,82 @@ class QuestSdfApp {
 
     hit.point = point;
     hit.menuChoice = -1;
+    hit.fragX = fragX;
+    hit.fragY = fragY;
 
-    const bool onMenuButton = fragX >= static_cast<float>(hud::kMenuButtonLeft) &&
-                              fragX <= static_cast<float>(hud::kMenuButtonRight) &&
-                              fragY >= static_cast<float>(hud::kMenuButtonTop) &&
-                              fragY <= static_cast<float>(hud::kMenuButtonBottom);
-    if (onMenuButton) {
-      hit.menuChoice = kMenuToggleChoice;
-      return true;
-    }
-
-    // With the menu closed, only the MENU button is interactive: the rest of
-    // the header must not block sculpting near the left hand.
+    // Menu closed: the panel is reduced to a single round MENU button.
     if (!menuVisible_) {
+      const float dx = fragX - static_cast<float>(hud::kContentWidth) * 0.5f;
+      const float dy = fragY - static_cast<float>(hud::kHeaderVisibleHeight) * 0.5f;
+      if (dx * dx + dy * dy <= 34.0f * 34.0f) {
+        hit.menuChoice = kChoiceMenuToggle;
+        return true;
+      }
       return false;
     }
 
-    const bool inToolColumn = fragX >= static_cast<float>(hud::kMenuToolColumnLeft) &&
-                              fragX <= static_cast<float>(hud::kMenuToolColumnRight);
-    const bool inActionColumn = fragX >= static_cast<float>(hud::kMenuActionColumnLeft) &&
-                                fragX <= static_cast<float>(hud::kMenuActionColumnRight);
-    if (inToolColumn || inActionColumn) {
-      const int rowCount = inToolColumn ? hud::kMenuToolRowCount : hud::kMenuActionRowCount;
-      for (int i = 0; i < rowCount; ++i) {
-        const float rowTop = static_cast<float>(hud::kMenuRowTop + i * hud::kMenuRowPitch);
-        const float rowBottom = rowTop + static_cast<float>(hud::kMenuRowHeight);
-        if (fragY >= rowTop && fragY <= rowBottom) {
-          hit.menuChoice = inToolColumn ? i : kMenuToolCount + i;
-          return true;
-        }
+    if (inRect(fragX, fragY, hud::kMenuButtonLeft, hud::kMenuButtonTop, hud::kMenuButtonRight,
+               hud::kMenuButtonBottom)) {
+      hit.menuChoice = kChoiceMenuToggle;
+      return true;
+    }
+
+    for (int i = 0; i < hud::kTabCount; ++i) {
+      const int left = hud::kTabFirstLeft + i * hud::kTabPitch;
+      if (inRect(fragX, fragY, left, hud::kTabTop, left + hud::kTabWidth, hud::kTabTop + hud::kTabHeight)) {
+        hit.menuChoice = kChoiceTabFirst + i;
+        return true;
       }
     }
 
-    const float paletteX = fragX - static_cast<float>(hud::kPaletteLeft);
-    const float paletteY = fragY - static_cast<float>(hud::kPaletteTop);
-    if (paletteX >= 0.0f && paletteY >= 0.0f) {
-      const int column = static_cast<int>(std::floor(paletteX / static_cast<float>(hud::kPalettePitch)));
-      const int row = static_cast<int>(std::floor(paletteY / static_cast<float>(hud::kPalettePitch)));
-      const bool inColumn = column >= 0 && column < hud::kPaletteColumns &&
-                            paletteX - static_cast<float>(column * hud::kPalettePitch) <=
-                                static_cast<float>(hud::kPaletteSwatch);
-      const bool inRow = row >= 0 && row < hud::kPaletteRows &&
-                         paletteY - static_cast<float>(row * hud::kPalettePitch) <=
-                             static_cast<float>(hud::kPaletteSwatch);
-      if (inColumn && inRow) {
-        hit.menuChoice = kMenuPaletteFirstChoice + row * hud::kPaletteColumns + column;
+    if (menuPage_ == kMenuPageTools) {
+      for (int i = 0; i < kVrToolCount; ++i) {
+        const int column = i % 2;
+        const int row = i / 2;
+        const int left = hud::kToolGridLeft + column * hud::kToolGridPitchX;
+        const int top = hud::kToolGridTop + row * hud::kToolGridPitchY;
+        if (inRect(fragX, fragY, left, top, left + hud::kToolButtonWidth, top + hud::kToolButtonHeight)) {
+          hit.menuChoice = kChoiceToolFirst + i;
+          return true;
+        }
+      }
+    } else if (menuPage_ == kMenuPageFiles) {
+      static constexpr std::array<int, hud::kFileRowCount> kFileChoices{
+          kChoiceSave, kChoiceLoad, kChoiceExport, kChoiceAr, kChoiceLock, kChoiceExit,
+      };
+      for (int i = 0; i < hud::kFileRowCount; ++i) {
+        const int top = hud::kFileRowTop + i * hud::kFileRowPitch;
+        if (inRect(fragX, fragY, hud::kFileRowLeft, top, hud::kFileRowRight, top + hud::kFileRowHeight)) {
+          hit.menuChoice = kFileChoices[static_cast<std::size_t>(i)];
+          return true;
+        }
+      }
+    } else if (menuPage_ == kMenuPageColor) {
+      if (inRect(fragX, fragY, hud::kSvLeft, hud::kSvTop, hud::kSvLeft + hud::kSvSize,
+                 hud::kSvTop + hud::kSvSize)) {
+        hit.menuChoice = kChoiceSvArea;
+        return true;
+      }
+      if (inRect(fragX, fragY, hud::kHueLeft, hud::kHueTop, hud::kHueLeft + hud::kHueWidth,
+                 hud::kHueTop + hud::kHueHeight)) {
+        hit.menuChoice = kChoiceHueBar;
+        return true;
+      }
+    } else if (menuPage_ == kMenuPageBrush) {
+      if (inRect(fragX, fragY, hud::kSliderLeft, hud::kSizeSliderTop, hud::kSliderRight,
+                 hud::kSizeSliderTop + hud::kSliderHeight)) {
+        hit.menuChoice = kChoiceSizeSlider;
+        return true;
+      }
+      if (inRect(fragX, fragY, hud::kSliderLeft, hud::kPowerSliderTop, hud::kSliderRight,
+                 hud::kPowerSliderTop + hud::kSliderHeight)) {
+        hit.menuChoice = kChoicePowerSlider;
+        return true;
+      }
+      if (inRect(fragX, fragY, hud::kSliderLeft, hud::kMirrorButtonTop, hud::kSliderRight,
+                 hud::kMirrorButtonBottom)) {
+        hit.menuChoice = kChoiceMirror;
+        return true;
       }
     }
     return true;
@@ -2646,48 +2734,101 @@ class QuestSdfApp {
     return resolveLeftUiHit(frame, point, hit);
   }
 
-  // Direct touch for hand tracking: the right index fingertip hovers and
-  // presses the wrist panel (menu rows, palette, MENU button). Returns true
-  // while the fingertip is in the panel interaction zone, which also
-  // suppresses sculpting so a pinch near the panel cannot carve the object.
-  bool updateHandMenuPoke() {
+  // Shared pointer handling: buttons fire on the press edge, continuous
+  // controls (sliders, color picker) update for as long as the press is held.
+  void applyMenuPointerState(const UiPointerHit& hit, bool pressed, bool pressEdge) {
+    namespace hud = large::hud;
+    menuHoverIndex_ = hit.menuChoice;
+    if (hit.menuChoice < 0) {
+      return;
+    }
+
+    const bool isContinuous = hit.menuChoice == kChoiceSvArea || hit.menuChoice == kChoiceHueBar ||
+                              hit.menuChoice == kChoiceSizeSlider || hit.menuChoice == kChoicePowerSlider;
+    if (!isContinuous) {
+      if (pressEdge) {
+        activateMenuChoice(hit.menuChoice);
+      }
+      return;
+    }
+
+    if (pressEdge) {
+      audio_.play(950.0f, 0.03f, 0.16f);
+    }
+    if (!pressed) {
+      return;
+    }
+
+    switch (hit.menuChoice) {
+      case kChoiceSvArea:
+        paintSat_ = large::sdf::clamp((hit.fragX - static_cast<float>(hud::kSvLeft)) /
+                                          static_cast<float>(hud::kSvSize), 0.0f, 1.0f);
+        paintVal_ = large::sdf::clamp(1.0f - (hit.fragY - static_cast<float>(hud::kSvTop)) /
+                                                 static_cast<float>(hud::kSvSize), 0.0f, 1.0f);
+        break;
+      case kChoiceHueBar:
+        paintHue_ = large::sdf::clamp((hit.fragY - static_cast<float>(hud::kHueTop)) /
+                                          static_cast<float>(hud::kHueHeight), 0.0f, 0.999f);
+        break;
+      case kChoiceSizeSlider: {
+        const float t = large::sdf::clamp((hit.fragX - static_cast<float>(hud::kSliderLeft)) /
+                                              static_cast<float>(hud::kSliderRight - hud::kSliderLeft), 0.0f, 1.0f);
+        brushRadius_ = kMinimumBrushRadius + (kMaximumBrushRadius - kMinimumBrushRadius) * t * t;
+        storeActiveToolSettings();
+        break;
+      }
+      case kChoicePowerSlider: {
+        const float t = large::sdf::clamp((hit.fragX - static_cast<float>(hud::kSliderLeft)) /
+                                              static_cast<float>(hud::kSliderRight - hud::kSliderLeft), 0.0f, 1.0f);
+        brushStrength_ = kMinimumBrushStrength + (kMaximumBrushStrength - kMinimumBrushStrength) * t;
+        storeActiveToolSettings();
+        break;
+      }
+      default:
+        break;
+    }
+  }
+
+  // Hand-tracking interaction: the right index fingertip touches the panel
+  // like a touchscreen. Its perpendicular projection on the panel hovers (a
+  // short beam + impact dot show where), and the press fires when the
+  // fingertip reaches the surface; keeping contact drags the sliders and the
+  // color picker. Returns true while the finger is in the interaction zone,
+  // which also suppresses sculpting.
+  bool updateHandMenuRay() {
     if (!rightHandState_.active || !isLeftUiVisible()) {
-      handPokeWasTouching_ = false;
+      handMenuSelectWasDown_ = false;
       return false;
     }
 
     UiPanelFrame frame{};
     if (!leftUiPanelFrame(frame)) {
-      handPokeWasTouching_ = false;
+      handMenuSelectWasDown_ = false;
       return false;
     }
 
     const large::sdf::Vec3 tip = rightHandState_.indexTip;
     const float planeDistance = large::sdf::dot(tip - frame.center, frame.forward);
-    if (planeDistance > 0.10f || planeDistance < -0.05f) {
-      handPokeWasTouching_ = false;
+    if (planeDistance > 0.12f || planeDistance < -0.04f) {
+      handMenuSelectWasDown_ = false;
       return false;
     }
 
     const large::sdf::Vec3 onPlane = tip - frame.forward * planeDistance;
     UiPointerHit hit{};
     if (!resolveLeftUiHit(frame, onPlane, hit)) {
-      handPokeWasTouching_ = false;
+      handMenuSelectWasDown_ = false;
       return false;
     }
 
     menuPointerActive_ = true;
-    menuHoverIndex_ = hit.menuChoice;
     menuPointerStart_ = tip;
     menuPointerEnd_ = onPlane;
 
-    // Press on plane contact, with hysteresis so a trembling fingertip does
-    // not double-trigger.
-    const bool touching = planeDistance < (handPokeWasTouching_ ? 0.030f : 0.012f);
-    if (touching && !handPokeWasTouching_ && hit.menuChoice >= 0) {
-      activateMenuChoice(hit.menuChoice);
-    }
-    handPokeWasTouching_ = touching;
+    // Press on surface contact, release with hysteresis.
+    const bool touching = planeDistance < (handMenuSelectWasDown_ ? 0.035f : 0.015f);
+    applyMenuPointerState(hit, touching, touching && !handMenuSelectWasDown_);
+    handMenuSelectWasDown_ = touching;
     return true;
   }
 
@@ -2702,12 +2843,9 @@ class QuestSdfApp {
     }
 
     menuPointerActive_ = true;
-    menuHoverIndex_ = hit.menuChoice;
     menuPointerStart_ = rayOrigin + rayDirection * 0.035f;
     menuPointerEnd_ = hit.point;
-    if (selectDown && !menuSelectWasDown_ && menuHoverIndex_ >= 0) {
-      activateMenuChoice(menuHoverIndex_);
-    }
+    applyMenuPointerState(hit, selectDown, selectDown && !menuSelectWasDown_);
     menuSelectWasDown_ = selectDown;
     return true;
   }
@@ -2735,7 +2873,20 @@ class QuestSdfApp {
       return;
     }
 
-    const bool leftHandGrab = leftHandState_.active && leftHandState_.fist;
+    // The left fist must be held briefly before it grabs the scene: a relaxed
+    // hand closing for a moment should not move the object by accident.
+    bool leftHandGrab = leftHandState_.active && leftHandState_.fist;
+    if (leftHandGrab && !oneHandGrabActive_ && !twoHandGrabActive_) {
+      if (leftFistArmFrame_ == 0) {
+        leftFistArmFrame_ = frameCounter_;
+        audio_.play(160.0f, kHandArmSeconds, 0.15f, true);
+      }
+      if (frameCounter_ < leftFistArmFrame_ + kHandArmFrames) {
+        leftHandGrab = false;
+      }
+    } else if (!leftHandGrab) {
+      leftFistArmFrame_ = 0;
+    }
     const bool rightHandGrab = false;
     const ControllerPose leftObjectPose = leftHandGrab ? leftHandState_.pose : leftGripPose_;
     const ControllerPose rightObjectPose = rightHandGrab ? rightHandState_.pose : rightGripPose_;
@@ -2759,6 +2910,7 @@ class QuestSdfApp {
         twoHandStartVector_ = right - left;
         twoHandStartObjectPosition_ = objectPosition_;
         twoHandStartObjectRotation_ = objectRotation_;
+        audio_.play(240.0f, 0.05f, 0.18f);
         logInfo("Two-hand grab started: distance=%.3f scale=%.2f", distance, objectScale_);
       }
 
@@ -2786,6 +2938,9 @@ class QuestSdfApp {
         grabStartObjectPosition_ = objectPosition_;
         grabStartHandOrientation_ = leftGrab ? leftObjectPose.orientation : rightObjectPose.orientation;
         grabStartObjectRotation_ = objectRotation_;
+        // A fist grab follows the arming buzz, so it ends with the same pop
+        // as the other armed gestures; controller grips keep a low thump.
+        audio_.play((leftGrab ? leftHandGrab : rightHandGrab) ? 980.0f : 240.0f, 0.05f, 0.20f);
         logInfo("%s %s grab started",
                 activeHand < 0 ? "Left" : "Right",
                 (leftGrab ? leftHandGrab : rightHandGrab) ? "hand" : "controller");
@@ -2807,7 +2962,7 @@ class QuestSdfApp {
   // space this shifts the object (and the procedural room, via uWorldOffset)
   // in the opposite direction, which is also the only visible effect in AR.
   void updateLocomotion(XrTime predictedDisplayTime) {
-    const XrVector2f stick = readVector2Action(locomotionAction_, rightHandPath_, "locomotion");
+    const XrVector2f stick = readVector2Action(locomotionAction_, leftHandPath_, "locomotion");
 
     float dt = 1.0f / 72.0f;
     if (lastLocomotionTime_ != 0) {
@@ -2881,6 +3036,15 @@ class QuestSdfApp {
   // The symmetry plane is local X=0 (the volume is centered on the origin).
   static large::sdf::Vec3 mirrorLocal(large::sdf::Vec3 p) { return {-p.x, p.y, p.z}; }
 
+  // Global tool power reduction. Add/Subtract at full strength stay exact
+  // CSG cuts (a half-blended union would re-introduce field artifacts); the
+  // reduction applies to their partial strengths and to every other tool.
+  static constexpr float kGlobalStrengthScale = 0.5f;
+
+  static float scaledCsgStrength(float strength) {
+    return strength >= 0.999f ? strength : strength * kGlobalStrengthScale;
+  }
+
   void applySculptStampAt(large::sdf::Vec3 from,
                           large::sdf::Vec3 centerLocal,
                           large::sdf::Vec3 flattenPoint,
@@ -2889,29 +3053,36 @@ class QuestSdfApp {
                           float strength) {
     switch (activeTool_) {
       case VrTool::Add:
-        volume_.applyCapsuleBrush(from, centerLocal, localBrushRadius, large::sdf::BrushMode::Add, strength);
+        volume_.applyCapsuleBrush(from, centerLocal, localBrushRadius, large::sdf::BrushMode::Add,
+                                  scaledCsgStrength(strength));
+        // Added material comes in the selected paint color (hard edge so the
+        // existing surface around the stroke keeps its own color).
+        applyPaintStroke(from, centerLocal, localBrushRadius, 1.0f, true);
         break;
       case VrTool::Subtract:
-        volume_.applyCapsuleBrush(from, centerLocal, localBrushRadius, large::sdf::BrushMode::Subtract, strength);
+        volume_.applyCapsuleBrush(from, centerLocal, localBrushRadius, large::sdf::BrushMode::Subtract,
+                                  scaledCsgStrength(strength));
         break;
       case VrTool::Smooth:
-        volume_.applySmoothBrush(centerLocal, localBrushRadius * 1.35f, strength * 0.65f);
+        volume_.applySmoothBrush(centerLocal, localBrushRadius * 1.35f,
+                                 strength * kGlobalStrengthScale * 0.65f);
         break;
       case VrTool::Flatten:
-        volume_.applyFlattenBrush(centerLocal, flattenPoint, flattenNormal, localBrushRadius * 1.25f, strength);
+        volume_.applyFlattenBrush(centerLocal, flattenPoint, flattenNormal, localBrushRadius * 1.25f,
+                                  strength * kGlobalStrengthScale);
         break;
       case VrTool::Groove:
         volume_.applyCapsuleBrush(from,
                                   centerLocal,
                                   std::max(localBrushRadius * 0.35f, volume_.voxelSize()),
                                   large::sdf::BrushMode::Subtract,
-                                  strength);
+                                  scaledCsgStrength(strength));
         break;
       case VrTool::Crease:
-        volume_.applyPinchBrush(centerLocal, localBrushRadius, strength);
+        volume_.applyPinchBrush(centerLocal, localBrushRadius, strength * kGlobalStrengthScale);
         break;
       case VrTool::Paint:
-        applyPaintStroke(from, centerLocal, localBrushRadius);
+        applyPaintStroke(from, centerLocal, localBrushRadius, brushStrength_ * kGlobalStrengthScale, false);
         break;
       case VrTool::Stretch:
         break;
@@ -2940,10 +3111,9 @@ class QuestSdfApp {
 
   void initializeColorVoxels() {
     const std::size_t count = volume_.values().size();
-    const auto& clay = kPaintPalette[0];
-    const std::uint8_t r = static_cast<std::uint8_t>(clay[0] * 255.0f + 0.5f);
-    const std::uint8_t g = static_cast<std::uint8_t>(clay[1] * 255.0f + 0.5f);
-    const std::uint8_t b = static_cast<std::uint8_t>(clay[2] * 255.0f + 0.5f);
+    const std::uint8_t r = static_cast<std::uint8_t>(kClayColor[0] * 255.0f + 0.5f);
+    const std::uint8_t g = static_cast<std::uint8_t>(kClayColor[1] * 255.0f + 0.5f);
+    const std::uint8_t b = static_cast<std::uint8_t>(kClayColor[2] * 255.0f + 0.5f);
     colorVoxels_.resize(count * 4);
     for (std::size_t i = 0; i < count; ++i) {
       colorVoxels_[i * 4 + 0] = r;
@@ -2964,8 +3134,11 @@ class QuestSdfApp {
   }
 
   // Blends the paint color into the color volume along a capsule, restricted
-  // to a narrow band around the current surface.
-  void applyPaintStroke(large::sdf::Vec3 from, large::sdf::Vec3 to, float localRadius) {
+  // to the material (solid voxels plus a thin outside shell). hardEdge paints
+  // at full blend up to the radius with no falloff (used when Add deposits
+  // colored material).
+  void applyPaintStroke(large::sdf::Vec3 from, large::sdf::Vec3 to, float localRadius, float strength,
+                        bool hardEdge) {
     if (localRadius <= 0.0f || colorVoxels_.empty()) {
       return;
     }
@@ -2974,7 +3147,8 @@ class QuestSdfApp {
     const float voxelSize = volume_.voxelSize();
     const large::sdf::Vec3 origin = volume_.origin();
     const float band = voxelSize * 4.0f;
-    const auto& paint = kPaintPalette[static_cast<std::size_t>(paintColorIndex_)];
+    const large::sdf::Vec3 paintRgb = paintColorRgb();
+    const std::array<float, 3> paint{paintRgb.x, paintRgb.y, paintRgb.z};
 
     const large::sdf::Vec3 minPoint{
         std::min(from.x, to.x) - localRadius,
@@ -3019,8 +3193,8 @@ class QuestSdfApp {
             continue;
           }
 
-          const float falloff = 1.0f - (dist / localRadius) * (dist / localRadius);
-          const float blend = large::sdf::clamp(brushStrength_ * falloff, 0.0f, 1.0f);
+          const float falloff = hardEdge ? 1.0f : 1.0f - (dist / localRadius) * (dist / localRadius);
+          const float blend = large::sdf::clamp(strength * falloff, 0.0f, 1.0f);
           std::uint8_t* voxel = colorVoxels_.data() + i * 4;
           for (int channel = 0; channel < 3; ++channel) {
             const float current = static_cast<float>(voxel[channel]) / 255.0f;
@@ -3160,6 +3334,7 @@ class QuestSdfApp {
       rightHandShapeBrushTool_ = -1;
       rightHandPinchToolActive_ = false;
       rightHandPinchTool_ = -1;
+      handPinchArmFrame_ = 0;
       if (rightHandPinchStretchActive_) {
         clearStretchInteraction();
       } else {
@@ -3177,6 +3352,23 @@ class QuestSdfApp {
     const float surfaceDistance = std::abs(volume_.sample(pinchLocal));
     const float snapDistance = std::max(kHandSculptSurfaceSnapDistance / std::max(objectScale_, 0.001f),
                                         volume_.voxelSize() * 2.0f);
+
+    // Arm delay: a new pinch must be held briefly before it starts acting,
+    // so a stray pinch does not instantly carve the object.
+    if (!rightHandPinchToolActive_ && !rightHandPinchStretchActive_) {
+      if (handPinchArmFrame_ == 0) {
+        handPinchArmFrame_ = frameCounter_;
+        audio_.play(160.0f, kHandArmSeconds, 0.15f, true);
+      }
+      if (frameCounter_ < handPinchArmFrame_ + kHandArmFrames) {
+        stretchPullActive_ = false;
+        brushVisible_ = activeTool_ == VrTool::Add ||
+                        surfaceDistance <= std::max(influenceRadius * 1.15f, snapDistance);
+        brushHitLocal_ = pinchLocal;
+        brushHitWorld_ = objectToWorldPoint(pinchLocal);
+        return true;
+      }
+    }
 
     if (activeTool_ != VrTool::Stretch) {
       rightHandPinchStretchActive_ = false;
@@ -3201,6 +3393,7 @@ class QuestSdfApp {
           large::sdf::Vec3 contactLocal = pinchLocal;
           const bool hasContact = findToolSurfaceContact(pinchLocal, influenceRadius, contactLocal);
           beginSculptStroke(pinchLocal, hasContact, contactLocal);
+          audio_.play(980.0f, 0.045f, 0.22f);
         }
 
         applySculptStamp(pinchLocal, influenceRadius, 1.0f);
@@ -3288,6 +3481,7 @@ class QuestSdfApp {
     if (!rightHandState_.active || rightHandState_.pinch || leftGripActive_ || rightGripActive_) {
       rightHandShapeBrushActive_ = false;
       rightHandShapeBrushTool_ = -1;
+      handShapeArmFrame_ = 0;
       return false;
     }
 
@@ -3296,7 +3490,19 @@ class QuestSdfApp {
     if (!erase && !smooth) {
       rightHandShapeBrushActive_ = false;
       rightHandShapeBrushTool_ = -1;
+      handShapeArmFrame_ = 0;
       return false;
+    }
+
+    // Same arm delay as the pinch: hold the gesture briefly before it bites.
+    if (!rightHandShapeBrushActive_) {
+      if (handShapeArmFrame_ == 0) {
+        handShapeArmFrame_ = frameCounter_;
+        audio_.play(160.0f, kHandArmSeconds, 0.15f, true);
+      }
+      if (frameCounter_ < handShapeArmFrame_ + kHandArmFrames) {
+        return true;
+      }
     }
 
     const int gestureToolIndex = erase ? 1 : 2;
@@ -3321,6 +3527,7 @@ class QuestSdfApp {
     if (frameCounter_ >= nextSculptFrame_) {
       if (!rightHandShapeBrushActive_ || rightHandShapeBrushTool_ != gestureToolIndex) {
         history_.capture();
+        audio_.play(980.0f, 0.045f, 0.22f);
       }
 
       if (erase) {
@@ -3373,6 +3580,7 @@ class QuestSdfApp {
     }
 
     updateObjectManipulation(predictedDisplayTime);
+    updateLeftUiFrame();
     updateLocomotion(predictedDisplayTime);
     updateLeftHandPinchZoom();
     updateBrushAdjustments();
@@ -3380,7 +3588,9 @@ class QuestSdfApp {
     updateEditButtons();
     rightTriggerValue_ = readFloatAction(rightTriggerAction_, rightHandPath_, "right trigger");
     const bool triggerDown = rightTriggerValue_ >= kTriggerThreshold;
-    const float localBrushRadius = brushRadius_ / std::max(objectScale_, 0.001f);
+    // The brush radius is defined in object-local units: it covers the same
+    // fraction of the sculpture whatever the workspace zoom.
+    const float localBrushRadius = brushRadius_;
     handDisplayToolIndex_ = -1;
     flattenPreviewVisible_ = false;
     if (!triggerDown) {
@@ -3396,7 +3606,7 @@ class QuestSdfApp {
       return;
     }
 
-    if (updateHandMenuPoke()) {
+    if (updateHandMenuRay()) {
       brushVisible_ = false;
       rightToolVisible_ = false;
       rightTriggerWasDown_ = triggerDown;
@@ -3517,6 +3727,7 @@ class QuestSdfApp {
         history_.capture();
         beginSculptStroke(toolCenterLocal, toolInContact, contactLocal);
         rightControllerToolStrokeActive_ = true;
+        audio_.play(980.0f, 0.045f, 0.22f);
       }
       applySculptStamp(toolCenterLocal, localBrushRadius, brushStrength_);
       uploadSdfTexture();
@@ -4558,11 +4769,16 @@ uniform sampler2D uHud;
 uniform vec2 uHudVisibleSize;  // panel pixels currently shown (header or full menu)
 uniform vec2 uHudFullSize;     // full HUD texture size in pixels
 uniform float uPanelWidth;     // panel width in meters
+uniform vec3 uPanelRight;      // panel basis shared with the CPU hit-testing
+uniform vec3 uPanelUp;
 uniform vec3 uPaintColor;
 uniform vec3 uFlattenPlaneCenter;
 uniform vec3 uFlattenPlaneNormal;
 uniform float uFlattenPlaneRadius;
 uniform float uFlattenPlaneVisible;
+uniform float uAdjustIndicator;  // fades in while the stick tunes the brush
+uniform float uSizeNorm;
+uniform float uPowerNorm;
 uniform vec3 uMirrorPlaneCenter;
 uniform vec3 uMirrorPlaneNormal;
 uniform float uMirrorPlaneRadius;
@@ -4638,6 +4854,14 @@ void applyMenuPointerLine(inout vec3 color, inout float alpha, vec3 rayOrigin, v
   float glow = 1.0 - smoothstep(0.014, 0.035, distance);
   vec3 pointerColor = mix(vec3(0.65, 0.88, 1.0), brushUiColor(), 0.35);
   paint(color, alpha, pointerColor, clamp(core * 0.95 + glow * 0.32, 0.0, 0.95));
+
+  // Bright impact dot where the pointer meets the panel.
+  float dotT = 0.0;
+  float dotDistance = rayPointDistance(rayOrigin, rayDir, uMenuPointerEnd, dotT);
+  float dotCore = 1.0 - smoothstep(0.005, 0.011, dotDistance);
+  float dotRing = 1.0 - smoothstep(0.0025, 0.0075, abs(dotDistance - 0.013));
+  paint(color, alpha, vec3(1.0), dotCore * 0.95);
+  paint(color, alpha, pointerColor, dotRing * 0.85);
 }
 
 void applyLeftHandUi(inout vec3 color, inout float alpha, vec3 rayOrigin, vec3 rayDir) {
@@ -4645,15 +4869,13 @@ void applyLeftHandUi(inout vec3 color, inout float alpha, vec3 rayOrigin, vec3 r
     return;
   }
 
+  // Use the exact same panel basis as the CPU hit-testing: a per-eye basis
+  // would draw the panel on a slightly different plane than the one being
+  // clicked, which offsets the pointer more and more toward the panel edges.
   vec3 center = uLeftUiPosition;
-  vec3 panelForward = normalize(rayOrigin - center);
-  vec3 panelRight = cross(vec3(0.0, 1.0, 0.0), panelForward);
-  if (dot(panelRight, panelRight) < 0.05) {
-    panelRight = vec3(1.0, 0.0, 0.0);
-  } else {
-    panelRight = normalize(panelRight);
-  }
-  vec3 panelUp = normalize(cross(panelForward, panelRight));
+  vec3 panelRight = uPanelRight;
+  vec3 panelUp = uPanelUp;
+  vec3 panelForward = cross(panelRight, panelUp);
   float denom = dot(rayDir, panelForward);
   if (abs(denom) < 0.001) {
     return;
@@ -4825,6 +5047,28 @@ void applyRightHandTool(inout vec3 color, inout float alpha, vec3 rayOrigin, vec
   float ringMask = 1.0 - smoothstep(0.0035, 0.010, abs(ringDistance - ringRadius));
   paint(color, alpha, brushUiColor(), ringMask * 0.30);
 
+  // Size/strength gauges: two concentric arcs around the tip, shown while
+  // the stick adjusts the brush (cyan = size, orange = strength). The arc
+  // starts at the bottom and fills clockwise with the value.
+  if (uAdjustIndicator > 0.01) {
+    vec3 camRight = uViewRotation * vec3(1.0, 0.0, 0.0);
+    vec3 camUp = uViewRotation * vec3(0.0, 1.0, 0.0);
+    vec3 arcPoint = rayOrigin + rayDir * ringT;
+    vec3 arcOffset = arcPoint - uRightToolPosition;
+    float angle = atan(dot(arcOffset, camRight), -dot(arcOffset, camUp));  // 0 at bottom
+    float angleFraction = (angle + 3.14159265) / 6.2831853;
+
+    float sizeRing = 1.0 - smoothstep(0.0045, 0.0095, abs(ringDistance - 0.050));
+    paint(color, alpha, vec3(0.09, 0.11, 0.13), sizeRing * 0.55 * uAdjustIndicator);
+    paint(color, alpha, vec3(0.25, 0.85, 1.0),
+          sizeRing * step(angleFraction, uSizeNorm) * 0.95 * uAdjustIndicator);
+
+    float powerRing = 1.0 - smoothstep(0.0045, 0.0095, abs(ringDistance - 0.064));
+    paint(color, alpha, vec3(0.09, 0.11, 0.13), powerRing * 0.55 * uAdjustIndicator);
+    paint(color, alpha, vec3(1.0, 0.60, 0.24),
+          powerRing * step(angleFraction, uPowerNorm) * 0.95 * uAdjustIndicator);
+  }
+
   // Sphere-trace the gizmo inside its bounding sphere only.
   vec3 boundCenter = uRightToolPosition - f * 0.07;
   float boundRadius = 0.155 + s * 2.2;
@@ -4917,8 +5161,27 @@ void applyTrackedHand(inout vec3 color, inout float alpha, vec3 rayOrigin, vec3 
     return;
   }
 
-  // Classic neutral hands, like the system ones: pale translucent capsules,
-  // identical for both hands; the active tool no longer recolors the hand.
+  if (hand == 1) {
+    // Right hand: minimal -- only thumb and index, thin opaque black, so the
+    // working hand never hides the sculpture. The index tip keeps the tool
+    // color accent.
+    vec3 ink = vec3(0.045, 0.05, 0.055);
+    float thin = 0.0055;
+    applyHandBone(color, alpha, rayOrigin, rayDir, handJoint(1, 1), handJoint(1, 2), ink, thin, 0.92);
+    applyHandBone(color, alpha, rayOrigin, rayDir, handJoint(1, 2), handJoint(1, 3), ink, thin, 0.92);
+    applyHandBone(color, alpha, rayOrigin, rayDir, handJoint(1, 3), handJoint(1, 4), ink, thin, 0.92);
+    applyHandBone(color, alpha, rayOrigin, rayDir, handJoint(1, 4), handJoint(1, 5), ink, thin, 0.92);
+    applyHandBone(color, alpha, rayOrigin, rayDir, handJoint(1, 1), handJoint(1, 6), ink, thin, 0.92);
+    applyHandBone(color, alpha, rayOrigin, rayDir, handJoint(1, 6), handJoint(1, 7), ink, thin, 0.92);
+    applyHandBone(color, alpha, rayOrigin, rayDir, handJoint(1, 7), handJoint(1, 8), ink, thin, 0.92);
+    applyHandBone(color, alpha, rayOrigin, rayDir, handJoint(1, 8), handJoint(1, 9), ink, thin, 0.92);
+    applyHandBone(color, alpha, rayOrigin, rayDir, handJoint(1, 9), handJoint(1, 10), ink, thin, 0.92);
+    applyHandJoint(color, alpha, rayOrigin, rayDir, handJoint(1, 10), toolPalette(uToolIndex), 0.007, 0.85);
+    return;
+  }
+
+  // Left hand: pale translucent capsules, only drawn while it grabs or
+  // pinches (the visibility flag is gated on the CPU side).
   vec3 baseColor = vec3(0.80, 0.83, 0.87);
   vec3 jointColor = baseColor;
   vec3 palmColor = baseColor;
@@ -4974,7 +5237,6 @@ void main() {
   vec3 rayOrigin = uCameraPos;
   vec3 color = vec3(0.0);
   float alpha = 0.0;
-  applyMenuPointerLine(color, alpha, rayOrigin, rayDir);
   if (uMirrorPlaneVisible > 0.5) {
     applyPlaneDisc(color, alpha, rayOrigin, rayDir, uMirrorPlaneCenter, uMirrorPlaneNormal, uMirrorPlaneRadius,
                    vec3(0.45, 0.75, 1.0), 0.10, 0.45);
@@ -4984,6 +5246,9 @@ void main() {
                    vec3(1.0, 0.85, 0.25), 0.15, 0.70);
   }
   applyLeftHandUi(color, alpha, rayOrigin, rayDir);
+  // The pointer beam and its impact dot are composited after the (opaque)
+  // panel so they stay visible on top of it.
+  applyMenuPointerLine(color, alpha, rayOrigin, rayDir);
   applyRightHandTool(color, alpha, rayOrigin, rayDir);
   applyTrackedHand(color, alpha, rayOrigin, rayDir, 0);
   applyTrackedHand(color, alpha, rayOrigin, rayDir, 1);
@@ -5017,11 +5282,16 @@ void main() {
     uiHudVisibleSizeLocation_ = glGetUniformLocation(uiProgram_, "uHudVisibleSize");
     uiHudFullSizeLocation_ = glGetUniformLocation(uiProgram_, "uHudFullSize");
     uiPanelWidthLocation_ = glGetUniformLocation(uiProgram_, "uPanelWidth");
+    uiPanelRightLocation_ = glGetUniformLocation(uiProgram_, "uPanelRight");
+    uiPanelUpLocation_ = glGetUniformLocation(uiProgram_, "uPanelUp");
     uiPaintColorLocation_ = glGetUniformLocation(uiProgram_, "uPaintColor");
     uiFlattenCenterLocation_ = glGetUniformLocation(uiProgram_, "uFlattenPlaneCenter");
     uiFlattenNormalLocation_ = glGetUniformLocation(uiProgram_, "uFlattenPlaneNormal");
     uiFlattenRadiusLocation_ = glGetUniformLocation(uiProgram_, "uFlattenPlaneRadius");
     uiFlattenVisibleLocation_ = glGetUniformLocation(uiProgram_, "uFlattenPlaneVisible");
+    uiAdjustIndicatorLocation_ = glGetUniformLocation(uiProgram_, "uAdjustIndicator");
+    uiSizeNormLocation_ = glGetUniformLocation(uiProgram_, "uSizeNorm");
+    uiPowerNormLocation_ = glGetUniformLocation(uiProgram_, "uPowerNorm");
     uiMirrorCenterLocation_ = glGetUniformLocation(uiProgram_, "uMirrorPlaneCenter");
     uiMirrorNormalLocation_ = glGetUniformLocation(uiProgram_, "uMirrorPlaneNormal");
     uiMirrorRadiusLocation_ = glGetUniformLocation(uiProgram_, "uMirrorPlaneRadius");
@@ -5036,9 +5306,11 @@ void main() {
         uiMenuPointerStartLocation_ < 0 || uiMenuPointerEndLocation_ < 0 || uiLeftHandVisibleLocation_ < 0 ||
         uiRightHandVisibleLocation_ < 0 || uiLeftHandJointsLocation_ < 0 || uiRightHandJointsLocation_ < 0 ||
         uiHudVisibleSizeLocation_ < 0 || uiHudFullSizeLocation_ < 0 || uiPanelWidthLocation_ < 0 ||
+        uiPanelRightLocation_ < 0 || uiPanelUpLocation_ < 0 ||
         uiPaintColorLocation_ < 0 || uiFlattenCenterLocation_ < 0 || uiFlattenNormalLocation_ < 0 ||
         uiFlattenRadiusLocation_ < 0 || uiFlattenVisibleLocation_ < 0 || uiMirrorCenterLocation_ < 0 ||
         uiMirrorNormalLocation_ < 0 || uiMirrorRadiusLocation_ < 0 || uiMirrorVisibleLocation_ < 0 ||
+        uiAdjustIndicatorLocation_ < 0 || uiSizeNormLocation_ < 0 || uiPowerNormLocation_ < 0 ||
         hudSamplerLocation < 0) {
       logError("UI overlay shader uniforms are missing");
       return false;
@@ -5081,6 +5353,7 @@ void main() {
 
   struct HudSnapshot {
     int toolIndex = -1;
+    int page = 0;
     float radius = 0.0f;
     float strength = 0.0f;
     bool menuVisible = false;
@@ -5089,17 +5362,28 @@ void main() {
     bool arAvailable = false;
     bool mirrorEnabled = false;
     bool lockEnabled = false;
-    int paintColor = 0;
+    float hue = 0.0f;
+    float sat = 0.0f;
+    float val = 0.0f;
     bool triggerPressed = false;
 
     bool operator==(const HudSnapshot& other) const {
-      return toolIndex == other.toolIndex && radius == other.radius && strength == other.strength &&
-             menuVisible == other.menuVisible && hoverIndex == other.hoverIndex && arEnabled == other.arEnabled &&
-             arAvailable == other.arAvailable && mirrorEnabled == other.mirrorEnabled &&
-             lockEnabled == other.lockEnabled && paintColor == other.paintColor &&
-             triggerPressed == other.triggerPressed;
+      return toolIndex == other.toolIndex && page == other.page && radius == other.radius &&
+             strength == other.strength && menuVisible == other.menuVisible && hoverIndex == other.hoverIndex &&
+             arEnabled == other.arEnabled && arAvailable == other.arAvailable &&
+             mirrorEnabled == other.mirrorEnabled && lockEnabled == other.lockEnabled && hue == other.hue &&
+             sat == other.sat && val == other.val && triggerPressed == other.triggerPressed;
     }
   };
+
+  large::sdf::Vec3 paintColorRgb() const { return hsvToRgb(paintHue_, paintSat_, paintVal_); }
+
+  static large::hud::Color toHudColor(large::sdf::Vec3 rgb, std::uint8_t alpha = 255) {
+    return {static_cast<std::uint8_t>(large::sdf::clamp(rgb.x, 0.0f, 1.0f) * 255.0f + 0.5f),
+            static_cast<std::uint8_t>(large::sdf::clamp(rgb.y, 0.0f, 1.0f) * 255.0f + 0.5f),
+            static_cast<std::uint8_t>(large::sdf::clamp(rgb.z, 0.0f, 1.0f) * 255.0f + 0.5f),
+            alpha};
+  }
 
   large::hud::Color toolUiColor(int index) const {
     switch (index) {
@@ -5115,20 +5399,15 @@ void main() {
         return {255, 140, 51, 255};
       case 6:
         return {140, 199, 242, 255};
-      case 7: {
-        const auto& paint = kPaintPalette[static_cast<std::size_t>(paintColorIndex_)];
-        return {static_cast<std::uint8_t>(paint[0] * 255.0f + 0.5f),
-                static_cast<std::uint8_t>(paint[1] * 255.0f + 0.5f),
-                static_cast<std::uint8_t>(paint[2] * 255.0f + 0.5f),
-                255};
-      }
+      case 7:
+        return toHudColor(paintColorRgb());
       default:
         return {64, 217, 255, 255};
     }
   }
 
   // Small silhouette of each tool, matching its 3D gizmo: drawn in the menu
-  // rows and in the header bar so tools are identified by shape, not color.
+  // buttons and in the header chip so tools are identified by shape.
   void drawToolIcon(int tool, int centerX, int centerY, large::hud::Color color, large::hud::Color accent) {
     large::hud::Painter& p = hudPainter_;
     switch (tool) {
@@ -5171,154 +5450,219 @@ void main() {
     hud::Painter& p = hudPainter_;
     p.clear();
 
-    const hud::Color panelBg{5, 6, 7, 205};
-    const hud::Color panelEdge{77, 92, 102, 185};
-    const hud::Color barBg{20, 26, 31, 235};
-    const hud::Color textMain{235, 242, 248, 255};
-    const hud::Color textDim{150, 162, 172, 255};
-    const hud::Color textDark{12, 14, 16, 255};
+    // Opaque card theme: dark panel, raised cards, single accent color.
+    const hud::Color panelBg{18, 21, 24, 255};
+    const hud::Color cardBg{32, 37, 43, 255};
+    const hud::Color cardHover{52, 60, 68, 255};
+    const hud::Color cardEdge{58, 66, 74, 255};
+    const hud::Color accent{61, 179, 148, 255};
+    const hud::Color danger{196, 72, 72, 255};
+    const hud::Color textMain{236, 242, 247, 255};
+    const hud::Color textDim{148, 160, 170, 255};
 
-    // Header: active tool, brush size and strength, shortcut reminders.
-    p.fillRect(hud::kHeaderLeft, hud::kHeaderTop, hud::kHeaderRight, hud::kHeaderBottom, panelBg);
-    p.outlineRect(hud::kHeaderLeft, hud::kHeaderTop, hud::kHeaderRight, hud::kHeaderBottom, 2, panelEdge);
+    // Menu closed: no mini panel, just a small round MENU button.
+    if (!snap.menuVisible) {
+      const int buttonX = hud::kContentWidth / 2;
+      const int buttonY = hud::kHeaderVisibleHeight / 2;
+      const bool hovered = snap.hoverIndex == kChoiceMenuToggle;
+      p.fillCircle(buttonX, buttonY, 32, hovered ? cardHover : panelBg);
+      p.ring(buttonX, buttonY, 32, 3, hovered ? textMain : accent);
+      p.drawTextCentered(buttonX, buttonY - 4, "MENU", 1, textMain);
+      return;
+    }
 
-    hud::Color toolColor = toolUiColor(snap.toolIndex);
-    toolColor.a = snap.triggerPressed ? 255 : 210;
-    p.fillRect(hud::kToolBarLeft, hud::kToolBarTop, hud::kToolBarRight, hud::kToolBarBottom, toolColor);
+    p.fillRoundedRect(0, 0, hud::kContentWidth, hud::kContentHeight, hud::kPanelCornerRadius, panelBg);
+    p.outlineRoundedRect(0, 0, hud::kContentWidth, hud::kContentHeight, hud::kPanelCornerRadius, 2, cardEdge);
+
+    // Header: active tool chip + MENU button.
+    hud::Color chipColor = toolUiColor(snap.toolIndex);
+    chipColor.a = snap.triggerPressed ? 255 : 220;
+    p.fillRoundedRect(hud::kHeaderChipLeft, hud::kHeaderChipTop, hud::kHeaderChipRight, hud::kHeaderChipBottom, 10,
+                      cardBg);
+    p.fillRoundedRect(hud::kHeaderChipLeft, hud::kHeaderChipTop, hud::kHeaderChipLeft + 6, hud::kHeaderChipBottom,
+                      3, chipColor);
+    const int chipCenterY = (hud::kHeaderChipTop + hud::kHeaderChipBottom) / 2;
+    drawToolIcon(snap.toolIndex, hud::kHeaderChipLeft + 28, chipCenterY, chipColor, chipColor);
     char nameBuffer[16] = {};
     const char* name = toolName(toolFromIndex(snap.toolIndex));
     for (int i = 0; name[i] != '\0' && i < 15; ++i) {
       nameBuffer[i] = static_cast<char>(std::toupper(static_cast<unsigned char>(name[i])));
     }
-    const int toolBarCenterY = (hud::kToolBarTop + hud::kToolBarBottom) / 2;
-    drawToolIcon(snap.toolIndex, hud::kToolBarLeft + 16, toolBarCenterY, textDark, textDark);
-    p.drawTextCentered((hud::kToolBarLeft + hud::kToolBarRight) / 2 + 10, hud::kToolBarTop + 3, nameBuffer, 2,
-                       textDark);
+    p.drawText(hud::kHeaderChipLeft + 48, chipCenterY - 7, nameBuffer, 2, textMain);
 
-    // MENU toggle button (finger poke or controller ray).
-    const bool menuButtonHovered = snap.hoverIndex == kMenuToggleChoice;
-    hud::Color menuButtonColor = snap.menuVisible ? hud::Color{61, 179, 148, 235} : hud::Color{66, 76, 86, 220};
-    p.fillRect(hud::kMenuButtonLeft, hud::kMenuButtonTop, hud::kMenuButtonRight, hud::kMenuButtonBottom,
-               menuButtonColor);
-    if (menuButtonHovered) {
-      p.fillRect(hud::kMenuButtonLeft, hud::kMenuButtonTop, hud::kMenuButtonRight, hud::kMenuButtonBottom,
-                 {200, 230, 245, 95});
-    }
-    p.outlineRect(hud::kMenuButtonLeft, hud::kMenuButtonTop, hud::kMenuButtonRight, hud::kMenuButtonBottom, 2,
-                  snap.menuVisible ? textMain : panelEdge);
+    const bool menuButtonHovered = snap.hoverIndex == kChoiceMenuToggle;
+    p.fillRoundedRect(hud::kMenuButtonLeft, hud::kMenuButtonTop, hud::kMenuButtonRight, hud::kMenuButtonBottom, 10,
+                      snap.menuVisible ? accent : (menuButtonHovered ? cardHover : cardBg));
+    p.outlineRoundedRect(hud::kMenuButtonLeft, hud::kMenuButtonTop, hud::kMenuButtonRight, hud::kMenuButtonBottom,
+                         10, 2, menuButtonHovered ? textMain : cardEdge);
     p.drawTextCentered((hud::kMenuButtonLeft + hud::kMenuButtonRight) / 2,
-                       (hud::kMenuButtonTop + hud::kMenuButtonBottom) / 2 - 3, "MENU", 1, textMain);
-
-    char valueBuffer[16] = {};
-    p.drawText(hud::kToolBarLeft, hud::kSizeRowY, "SIZE", 1, textDim);
-    p.fillRect(hud::kBarLeft, hud::kSizeRowY - 1, hud::kBarRight, hud::kSizeRowY - 1 + hud::kBarHeight, barBg);
-    const float sizeNorm = large::sdf::clamp(
-        (snap.radius - kMinimumBrushRadius) / (kMaximumBrushRadius - kMinimumBrushRadius), 0.0f, 1.0f);
-    p.fillRect(hud::kBarLeft,
-               hud::kSizeRowY - 1,
-               hud::kBarLeft + static_cast<int>((hud::kBarRight - hud::kBarLeft) * sizeNorm),
-               hud::kSizeRowY - 1 + hud::kBarHeight,
-               {64, 217, 255, 255});
-    std::snprintf(valueBuffer, sizeof(valueBuffer), "%.0fCM", snap.radius * 100.0f);
-    p.drawText(hud::kBarRight + 6, hud::kSizeRowY, valueBuffer, 1, textMain);
-
-    p.drawText(hud::kToolBarLeft, hud::kPowerRowY, "POWER", 1, textDim);
-    p.fillRect(hud::kBarLeft, hud::kPowerRowY - 1, hud::kBarRight, hud::kPowerRowY - 1 + hud::kBarHeight, barBg);
-    const float powerNorm = large::sdf::clamp(snap.strength, 0.0f, 1.0f);
-    p.fillRect(hud::kBarLeft,
-               hud::kPowerRowY - 1,
-               hud::kBarLeft + static_cast<int>((hud::kBarRight - hud::kBarLeft) * powerNorm),
-               hud::kPowerRowY - 1 + hud::kBarHeight,
-               {255, 153, 61, 255});
-    std::snprintf(valueBuffer, sizeof(valueBuffer), "%.0f%%", powerNorm * 100.0f);
-    p.drawText(hud::kBarRight + 6, hud::kPowerRowY, valueBuffer, 1, textMain);
-
-    p.drawText(hud::kToolBarLeft, hud::kFooterY, "X:UNDO Y:REDO A/B:TOOL", 1, textDim);
+                       (hud::kMenuButtonTop + hud::kMenuButtonBottom) / 2 - 4, "MENU", 1, textMain);
 
     if (!snap.menuVisible) {
       return;
     }
 
-    // Menu: tools column on the left, action column on the right, palette
-    // full width below.
-    p.fillRect(hud::kHeaderLeft, hud::kMenuPanelTop, hud::kHeaderRight, hud::kMenuPanelBottom, panelBg);
-    p.outlineRect(hud::kHeaderLeft, hud::kMenuPanelTop, hud::kHeaderRight, hud::kMenuPanelBottom, 2, panelEdge);
-
-    static const char* kToolLabels[hud::kMenuToolRowCount] = {
-        "ADD", "SUBTRACT", "SMOOTH", "STRETCH", "FLATTEN", "GROOVE", "CREASE", "PAINT",
-    };
-    const auto& selectedPaint = kPaintPalette[static_cast<std::size_t>(snap.paintColor)];
-    const hud::Color paintAccent{static_cast<std::uint8_t>(selectedPaint[0] * 255.0f + 0.5f),
-                                 static_cast<std::uint8_t>(selectedPaint[1] * 255.0f + 0.5f),
-                                 static_cast<std::uint8_t>(selectedPaint[2] * 255.0f + 0.5f),
-                                 255};
-    for (int i = 0; i < hud::kMenuToolRowCount; ++i) {
-      const int top = hud::kMenuRowTop + i * hud::kMenuRowPitch;
-      const bool active = i == snap.toolIndex;
-      const bool hovered = i == snap.hoverIndex;
-
-      hud::Color rowColor = toolUiColor(i);
-      rowColor.a = active ? 235 : 110;
-      p.fillRect(hud::kMenuToolColumnLeft, top, hud::kMenuToolColumnRight, top + hud::kMenuRowHeight, rowColor);
-      if (hovered) {
-        p.fillRect(hud::kMenuToolColumnLeft, top, hud::kMenuToolColumnRight, top + hud::kMenuRowHeight,
-                   {200, 230, 245, 95});
+    // Tab bar.
+    static const char* kTabLabels[hud::kTabCount] = {"OUTILS", "FICHIERS", "COULEUR", "PINCEAU"};
+    for (int i = 0; i < hud::kTabCount; ++i) {
+      const int left = hud::kTabFirstLeft + i * hud::kTabPitch;
+      const bool active = i == snap.page;
+      const bool hovered = snap.hoverIndex == kChoiceTabFirst + i;
+      p.fillRoundedRect(left, hud::kTabTop, left + hud::kTabWidth, hud::kTabTop + hud::kTabHeight, 8,
+                        (active || hovered) ? cardHover : cardBg);
+      if (active) {
+        p.fillRoundedRect(left + 8, hud::kTabTop + hud::kTabHeight - 7, left + hud::kTabWidth - 8,
+                          hud::kTabTop + hud::kTabHeight - 3, 2, accent);
       }
-      p.outlineRect(hud::kMenuToolColumnLeft, top, hud::kMenuToolColumnRight, top + hud::kMenuRowHeight, 1,
-                    active ? textMain : panelEdge);
-      drawToolIcon(i, hud::kMenuToolColumnLeft + hud::kMenuIconCenterOffset, top + hud::kMenuRowHeight / 2,
-                   textMain, paintAccent);
-      p.drawTextCentered((hud::kMenuToolColumnLeft + 2 * hud::kMenuIconCenterOffset + hud::kMenuToolColumnRight) / 2,
-                         top + 5, kToolLabels[i], 2, textMain);
+      p.drawTextCentered(left + hud::kTabWidth / 2, hud::kTabTop + 14, kTabLabels[i], 1,
+                         active ? textMain : textDim);
     }
 
-    static const char* kActionLabels[hud::kMenuActionRowCount] = {
-        "SAVE", "LOAD", "EXPORT", "QUIT", "AR", "MIRROR", "LOCK",
-    };
-    for (int i = 0; i < hud::kMenuActionRowCount; ++i) {
-      const int top = hud::kMenuRowTop + i * hud::kMenuRowPitch;
-      const int choice = kMenuToolCount + i;
-      const bool isArRow = choice == kMenuArChoice;
-      const bool isMirrorRow = choice == kMenuMirrorChoice;
-      const bool isLockRow = choice == kMenuLockChoice;
-      const bool toggledOn = (isArRow && snap.arEnabled) || (isMirrorRow && snap.mirrorEnabled) ||
-                             (isLockRow && snap.lockEnabled);
-      const bool hovered = choice == snap.hoverIndex;
+    if (snap.page == kMenuPageTools) {
+      static const char* kToolLabels[kVrToolCount] = {
+          "ADD", "SUBTRACT", "SMOOTH", "STRETCH", "FLATTEN", "GROOVE", "CREASE", "PAINT",
+      };
+      const hud::Color paintAccent = toHudColor(hsvToRgb(snap.hue, snap.sat, snap.val));
+      for (int i = 0; i < kVrToolCount; ++i) {
+        const int column = i % 2;
+        const int row = i / 2;
+        const int left = hud::kToolGridLeft + column * hud::kToolGridPitchX;
+        const int top = hud::kToolGridTop + row * hud::kToolGridPitchY;
+        const int right = left + hud::kToolButtonWidth;
+        const int bottom = top + hud::kToolButtonHeight;
+        const bool active = i == snap.toolIndex;
+        const bool hovered = snap.hoverIndex == kChoiceToolFirst + i;
+        const hud::Color toolColor = toolUiColor(i);
 
-      hud::Color rowColor = toggledOn ? hud::Color{61, 179, 148, 225} : hud::Color{66, 76, 86, 190};
-      if (isArRow && !snap.arAvailable) {
-        rowColor = {40, 45, 50, 190};
+        p.fillRoundedRect(left, top, right, bottom, 10, hovered ? cardHover : cardBg);
+        if (active) {
+          hud::Color tint = toolColor;
+          tint.a = 70;
+          p.fillRoundedRect(left, top, right, bottom, 10, tint);
+          p.outlineRoundedRect(left, top, right, bottom, 10, 3, toolColor);
+        }
+        drawToolIcon(i, (left + right) / 2, top + 34, toolColor, paintAccent);
+        p.drawTextCentered((left + right) / 2, top + 62, kToolLabels[i], 2, active ? textMain : textDim);
       }
-      p.fillRect(hud::kMenuActionColumnLeft, top, hud::kMenuActionColumnRight, top + hud::kMenuRowHeight, rowColor);
-      if (hovered) {
-        p.fillRect(hud::kMenuActionColumnLeft, top, hud::kMenuActionColumnRight, top + hud::kMenuRowHeight,
-                   {200, 230, 245, 95});
+    } else if (snap.page == kMenuPageFiles) {
+      struct FileRow {
+        const char* label;
+        int choice;
+      };
+      char arLabel[16] = {};
+      std::snprintf(arLabel, sizeof(arLabel), "AR: %s", !snap.arAvailable ? "N/A" : (snap.arEnabled ? "ON" : "OFF"));
+      char lockLabel[16] = {};
+      std::snprintf(lockLabel, sizeof(lockLabel), "LOCK: %s", snap.lockEnabled ? "ON" : "OFF");
+      const FileRow rows[hud::kFileRowCount] = {
+          {"SAVE", kChoiceSave},     {"LOAD", kChoiceLoad},    {"EXPORT", kChoiceExport},
+          {arLabel, kChoiceAr},      {lockLabel, kChoiceLock}, {"EXIT", kChoiceExit},
+      };
+      for (int i = 0; i < hud::kFileRowCount; ++i) {
+        const int top = hud::kFileRowTop + i * hud::kFileRowPitch;
+        const int bottom = top + hud::kFileRowHeight;
+        const bool hovered = snap.hoverIndex == rows[i].choice;
+        const bool toggledOn = (rows[i].choice == kChoiceAr && snap.arEnabled) ||
+                               (rows[i].choice == kChoiceLock && snap.lockEnabled);
+        hud::Color rowColor = hovered ? cardHover : cardBg;
+        if (toggledOn) {
+          rowColor = accent;
+        } else if (rows[i].choice == kChoiceExit) {
+          rowColor = hovered ? hud::Color{214, 92, 92, 255} : danger;
+        }
+        p.fillRoundedRect(hud::kFileRowLeft, top, hud::kFileRowRight, bottom, 10, rowColor);
+        if (hovered) {
+          p.outlineRoundedRect(hud::kFileRowLeft, top, hud::kFileRowRight, bottom, 10, 2, textMain);
+        }
+        const hud::Color labelColor =
+            (rows[i].choice == kChoiceAr && !snap.arAvailable) ? textDim : textMain;
+        p.drawTextCentered((hud::kFileRowLeft + hud::kFileRowRight) / 2, (top + bottom) / 2 - 7, rows[i].label, 2,
+                           labelColor);
       }
-      p.outlineRect(hud::kMenuActionColumnLeft, top, hud::kMenuActionColumnRight, top + hud::kMenuRowHeight, 1,
-                    toggledOn ? textMain : panelEdge);
-      const hud::Color labelColor = (isArRow && !snap.arAvailable) ? textDim : textMain;
-      p.drawTextCentered((hud::kMenuActionColumnLeft + hud::kMenuActionColumnRight) / 2, top + 5, kActionLabels[i],
-                         2, labelColor);
-    }
+    } else if (snap.page == kMenuPageColor) {
+      // Current color preview.
+      p.fillRoundedRect(hud::kColorPreviewLeft, hud::kColorPreviewTop, hud::kColorPreviewRight,
+                        hud::kColorPreviewBottom, 10, toHudColor(hsvToRgb(snap.hue, snap.sat, snap.val)));
+      p.outlineRoundedRect(hud::kColorPreviewLeft, hud::kColorPreviewTop, hud::kColorPreviewRight,
+                           hud::kColorPreviewBottom, 10, 2, cardEdge);
 
-    p.drawText(hud::kPaletteLeft, hud::kPaletteLabelY, "PAINT COLOR", 1, textDim);
-    for (int i = 0; i < hud::kPaletteCount; ++i) {
-      const int column = i % hud::kPaletteColumns;
-      const int row = i / hud::kPaletteColumns;
-      const int x = hud::kPaletteLeft + column * hud::kPalettePitch;
-      const int y = hud::kPaletteTop + row * hud::kPalettePitch;
-      const auto& paint = kPaintPalette[static_cast<std::size_t>(i)];
-      const hud::Color swatch{static_cast<std::uint8_t>(paint[0] * 255.0f + 0.5f),
-                              static_cast<std::uint8_t>(paint[1] * 255.0f + 0.5f),
-                              static_cast<std::uint8_t>(paint[2] * 255.0f + 0.5f),
-                              255};
-      p.fillRect(x, y, x + hud::kPaletteSwatch, y + hud::kPaletteSwatch, swatch);
-      const bool selected = i == snap.paintColor;
-      const bool hovered = snap.hoverIndex == kMenuPaletteFirstChoice + i;
-      if (selected || hovered) {
-        p.outlineRect(x, y, x + hud::kPaletteSwatch, y + hud::kPaletteSwatch, 3,
-                      selected ? textMain : textDim);
+      // Saturation/value square for the current hue.
+      for (int y = 0; y < hud::kSvSize; ++y) {
+        const float value = 1.0f - static_cast<float>(y) / static_cast<float>(hud::kSvSize - 1);
+        for (int x = 0; x < hud::kSvSize; ++x) {
+          const float saturation = static_cast<float>(x) / static_cast<float>(hud::kSvSize - 1);
+          p.blendPixel(hud::kSvLeft + x, hud::kSvTop + y, toHudColor(hsvToRgb(snap.hue, saturation, value)));
+        }
       }
+      p.outlineRect(hud::kSvLeft, hud::kSvTop, hud::kSvLeft + hud::kSvSize, hud::kSvTop + hud::kSvSize, 1,
+                    cardEdge);
+      const int svMarkerX = hud::kSvLeft + static_cast<int>(snap.sat * (hud::kSvSize - 1));
+      const int svMarkerY = hud::kSvTop + static_cast<int>((1.0f - snap.val) * (hud::kSvSize - 1));
+      p.ring(svMarkerX, svMarkerY, 9, 3, textMain);
+      p.ring(svMarkerX, svMarkerY, 11, 1, {20, 20, 20, 255});
+
+      // Hue bar.
+      for (int y = 0; y < hud::kHueHeight; ++y) {
+        const float hue = static_cast<float>(y) / static_cast<float>(hud::kHueHeight - 1);
+        const hud::Color rowColor = toHudColor(hsvToRgb(hue, 1.0f, 1.0f));
+        p.fillRect(hud::kHueLeft, hud::kHueTop + y, hud::kHueLeft + hud::kHueWidth, hud::kHueTop + y + 1, rowColor);
+      }
+      p.outlineRect(hud::kHueLeft, hud::kHueTop, hud::kHueLeft + hud::kHueWidth, hud::kHueTop + hud::kHueHeight, 1,
+                    cardEdge);
+      const int hueMarkerY = hud::kHueTop + static_cast<int>(snap.hue * (hud::kHueHeight - 1));
+      p.fillRect(hud::kHueLeft - 3, hueMarkerY - 3, hud::kHueLeft + hud::kHueWidth + 3, hueMarkerY + 3, textMain);
+      p.fillRect(hud::kHueLeft - 2, hueMarkerY - 2, hud::kHueLeft + hud::kHueWidth + 2, hueMarkerY + 2,
+                 toHudColor(hsvToRgb(snap.hue, 1.0f, 1.0f)));
+    } else if (snap.page == kMenuPageBrush) {
+      char valueBuffer[24] = {};
+
+      // SIZE slider (quadratic ramp for finer control on small radii).
+      p.drawText(hud::kSliderLeft + 4, hud::kSizeSliderTop - 18, "TAILLE", 1, textDim);
+      std::snprintf(valueBuffer, sizeof(valueBuffer), "%.1fCM", snap.radius * 100.0f);
+      p.drawText(hud::kSliderRight - large::hud::Painter::textWidth(valueBuffer, 1) - 4,
+                 hud::kSizeSliderTop - 18, valueBuffer, 1, textMain);
+      const float sizeT = std::sqrt(large::sdf::clamp(
+          (snap.radius - kMinimumBrushRadius) / (kMaximumBrushRadius - kMinimumBrushRadius), 0.0f, 1.0f));
+      p.fillRoundedRect(hud::kSliderLeft, hud::kSizeSliderTop, hud::kSliderRight,
+                        hud::kSizeSliderTop + hud::kSliderHeight, 12,
+                        snap.hoverIndex == kChoiceSizeSlider ? cardHover : cardBg);
+      const int sizeKnobX = hud::kSliderLeft + 22 +
+                            static_cast<int>(sizeT * static_cast<float>(hud::kSliderRight - hud::kSliderLeft - 44));
+      p.fillRoundedRect(hud::kSliderLeft + 4, hud::kSizeSliderTop + 14, sizeKnobX,
+                        hud::kSizeSliderTop + hud::kSliderHeight - 14, 8, {64, 217, 255, 255});
+      p.fillCircle(sizeKnobX, hud::kSizeSliderTop + hud::kSliderHeight / 2, 16, textMain);
+
+      // POWER slider.
+      p.drawText(hud::kSliderLeft + 4, hud::kPowerSliderTop - 18, "FORCE", 1, textDim);
+      std::snprintf(valueBuffer, sizeof(valueBuffer), "%.0f%%", snap.strength * 100.0f);
+      p.drawText(hud::kSliderRight - large::hud::Painter::textWidth(valueBuffer, 1) - 4,
+                 hud::kPowerSliderTop - 18, valueBuffer, 1, textMain);
+      const float powerT = large::sdf::clamp(
+          (snap.strength - kMinimumBrushStrength) / (kMaximumBrushStrength - kMinimumBrushStrength), 0.0f, 1.0f);
+      p.fillRoundedRect(hud::kSliderLeft, hud::kPowerSliderTop, hud::kSliderRight,
+                        hud::kPowerSliderTop + hud::kSliderHeight, 12,
+                        snap.hoverIndex == kChoicePowerSlider ? cardHover : cardBg);
+      const int powerKnobX = hud::kSliderLeft + 22 +
+                             static_cast<int>(powerT * static_cast<float>(hud::kSliderRight - hud::kSliderLeft - 44));
+      p.fillRoundedRect(hud::kSliderLeft + 4, hud::kPowerSliderTop + 14, powerKnobX,
+                        hud::kPowerSliderTop + hud::kSliderHeight - 14, 8, {255, 153, 61, 255});
+      p.fillCircle(powerKnobX, hud::kPowerSliderTop + hud::kSliderHeight / 2, 16, textMain);
+
+      // MIRROR toggle.
+      const bool mirrorHovered = snap.hoverIndex == kChoiceMirror;
+      p.fillRoundedRect(hud::kSliderLeft, hud::kMirrorButtonTop, hud::kSliderRight, hud::kMirrorButtonBottom, 10,
+                        snap.mirrorEnabled ? accent : (mirrorHovered ? cardHover : cardBg));
+      if (mirrorHovered) {
+        p.outlineRoundedRect(hud::kSliderLeft, hud::kMirrorButtonTop, hud::kSliderRight, hud::kMirrorButtonBottom,
+                             10, 2, textMain);
+      }
+      char mirrorLabel[20] = {};
+      std::snprintf(mirrorLabel, sizeof(mirrorLabel), "MIROIR: %s", snap.mirrorEnabled ? "ON" : "OFF");
+      p.drawTextCentered((hud::kSliderLeft + hud::kSliderRight) / 2,
+                         (hud::kMirrorButtonTop + hud::kMirrorButtonBottom) / 2 - 7, mirrorLabel, 2, textMain);
+
+      // Brush size preview circle.
+      const int previewRadius = 14 + static_cast<int>(sizeT * 54.0f);
+      p.ring(hud::kContentWidth / 2, hud::kBrushPreviewCenterY, previewRadius, 3, toolUiColor(snap.toolIndex));
     }
   }
 
@@ -5329,6 +5673,7 @@ void main() {
 
     HudSnapshot snap{};
     snap.toolIndex = displayToolIndex();
+    snap.page = menuPage_;
     snap.radius = brushRadius_;
     snap.strength = brushStrength_;
     snap.menuVisible = menuVisible_;
@@ -5337,7 +5682,9 @@ void main() {
     snap.arAvailable = passthroughReady_;
     snap.mirrorEnabled = mirrorEnabled_;
     snap.lockEnabled = objectLocked_;
-    snap.paintColor = paintColorIndex_;
+    snap.hue = paintHue_;
+    snap.sat = paintSat_;
+    snap.val = paintVal_;
     snap.triggerPressed = rightTriggerValue_ >= kTriggerThreshold;
     if (hudPainted_ && snap == hudSnapshot_) {
       return;
@@ -5398,7 +5745,8 @@ void main() {
                 std::tan(views_[eye].fov.angleRight),
                 std::tan(views_[eye].fov.angleDown),
                 std::tan(views_[eye].fov.angleUp));
-    glUniform1f(uiBrushRadiusLocation_, brushRadius_);
+    // The brush is object-relative; visuals get the world-equivalent size.
+    glUniform1f(uiBrushRadiusLocation_, brushRadius_ * objectScale_);
     glUniform1f(uiTriggerValueLocation_, rightTriggerValue_);
     glUniform1i(uiToolIndexLocation_, displayToolIndex());
     glUniform3f(uiLeftUiPositionLocation_, uiPosition.x, uiPosition.y, uiPosition.z);
@@ -5409,7 +5757,11 @@ void main() {
     glUniform1f(uiMenuPointerActiveLocation_, menuPointerActive_ ? 1.0f : 0.0f);
     glUniform3f(uiMenuPointerStartLocation_, menuPointerStart_.x, menuPointerStart_.y, menuPointerStart_.z);
     glUniform3f(uiMenuPointerEndLocation_, menuPointerEnd_.x, menuPointerEnd_.y, menuPointerEnd_.z);
-    glUniform1f(uiLeftHandVisibleLocation_, leftHandState_.active ? 1.0f : 0.0f);
+    // The left hand is only drawn while it acts (grab fist or pinch zoom);
+    // idle it would just hide the view.
+    const bool leftHandShown =
+        leftHandState_.active && (leftHandState_.fist || leftHandState_.pinch || leftGripActive_);
+    glUniform1f(uiLeftHandVisibleLocation_, leftHandShown ? 1.0f : 0.0f);
     glUniform1f(uiRightHandVisibleLocation_, rightHandState_.active ? 1.0f : 0.0f);
     glUniform3fv(uiLeftHandJointsLocation_, XR_HAND_JOINT_COUNT_EXT, leftHandJoints.data());
     glUniform3fv(uiRightHandJointsLocation_, XR_HAND_JOINT_COUNT_EXT, rightHandJoints.data());
@@ -5420,8 +5772,10 @@ void main() {
                 static_cast<float>(large::hud::kContentWidth),
                 static_cast<float>(large::hud::kContentHeight));
     glUniform1f(uiPanelWidthLocation_, large::hud::kPanelWidthMeters);
-    const auto& paintColor = kPaintPalette[static_cast<std::size_t>(paintColorIndex_)];
-    glUniform3f(uiPaintColorLocation_, paintColor[0], paintColor[1], paintColor[2]);
+    glUniform3f(uiPanelRightLocation_, uiFrame_.right.x, uiFrame_.right.y, uiFrame_.right.z);
+    glUniform3f(uiPanelUpLocation_, uiFrame_.up.x, uiFrame_.up.y, uiFrame_.up.z);
+    const large::sdf::Vec3 paintColor = paintColorRgb();
+    glUniform3f(uiPaintColorLocation_, paintColor.x, paintColor.y, paintColor.z);
     glUniform3f(uiFlattenCenterLocation_,
                 flattenPreviewCenterWorld_.x,
                 flattenPreviewCenterWorld_.y,
@@ -5430,8 +5784,19 @@ void main() {
                 flattenPreviewNormalWorld_.x,
                 flattenPreviewNormalWorld_.y,
                 flattenPreviewNormalWorld_.z);
-    glUniform1f(uiFlattenRadiusLocation_, brushRadius_ * 1.25f);
+    glUniform1f(uiFlattenRadiusLocation_, brushRadius_ * 1.25f * objectScale_);
     glUniform1f(uiFlattenVisibleLocation_, flattenPreviewVisible_ ? 1.0f : 0.0f);
+    // Brush adjust gauges fade out ~0.75 s after the last stick input.
+    const float framesSinceAdjust =
+        lastBrushAdjustFrame_ == 0 ? 1000.0f : static_cast<float>(frameCounter_ - lastBrushAdjustFrame_);
+    glUniform1f(uiAdjustIndicatorLocation_,
+                large::sdf::clamp(1.0f - framesSinceAdjust / 54.0f, 0.0f, 1.0f));
+    glUniform1f(uiSizeNormLocation_,
+                std::sqrt(large::sdf::clamp((brushRadius_ - kMinimumBrushRadius) /
+                                                (kMaximumBrushRadius - kMinimumBrushRadius), 0.0f, 1.0f)));
+    glUniform1f(uiPowerNormLocation_,
+                large::sdf::clamp((brushStrength_ - kMinimumBrushStrength) /
+                                      (kMaximumBrushStrength - kMinimumBrushStrength), 0.0f, 1.0f));
     // Mirror plane disc: local X=0, sized to the sculpted region.
     const large::sdf::Vec3 boundsMin = renderBoundsMin();
     const large::sdf::Vec3 boundsExtent = renderBoundsExtent();
@@ -5633,6 +5998,7 @@ void main() {
   large::sdf::SdfVolume volume_;
   large::sdf::SdfVolume stretchSourceVolume_;
   large::sdf::SdfHistory history_;
+  large::audio::Feedback audio_;
   bool isFocused_ = false;
   bool hasWindow_ = false;
   std::chrono::steady_clock::time_point nextStatsLog_{};
@@ -5664,7 +6030,10 @@ void main() {
   large::hud::Painter hudPainter_{large::hud::kContentWidth, large::hud::kContentHeight};
   HudSnapshot hudSnapshot_{};
   bool hudPainted_ = false;
-  int paintColorIndex_ = 3;
+  int menuPage_ = kMenuPageTools;
+  float paintHue_ = 0.04f;
+  float paintSat_ = 0.80f;
+  float paintVal_ = 0.85f;
   GLuint uiProgram_ = 0;
   GLuint uiVao_ = 0;
   GLint sdfCameraLocation_ = -1;
@@ -5702,6 +6071,8 @@ void main() {
   GLint uiHudVisibleSizeLocation_ = -1;
   GLint uiHudFullSizeLocation_ = -1;
   GLint uiPanelWidthLocation_ = -1;
+  GLint uiPanelRightLocation_ = -1;
+  GLint uiPanelUpLocation_ = -1;
   GLint uiPaintColorLocation_ = -1;
   GLint uiFlattenCenterLocation_ = -1;
   GLint uiFlattenNormalLocation_ = -1;
@@ -5711,6 +6082,9 @@ void main() {
   GLint uiMirrorNormalLocation_ = -1;
   GLint uiMirrorRadiusLocation_ = -1;
   GLint uiMirrorVisibleLocation_ = -1;
+  GLint uiAdjustIndicatorLocation_ = -1;
+  GLint uiSizeNormLocation_ = -1;
+  GLint uiPowerNormLocation_ = -1;
   XrActionSet actionSet_ = XR_NULL_HANDLE;
   XrAction rightAimPoseAction_ = XR_NULL_HANDLE;
   XrAction rightTriggerAction_ = XR_NULL_HANDLE;
@@ -5809,7 +6183,14 @@ void main() {
   large::sdf::Vec3 flattenPreviewNormalWorld_{0.0f, 1.0f, 0.0f};
   bool mirrorEnabled_ = false;
   bool objectLocked_ = false;
-  bool handPokeWasTouching_ = false;
+  bool handMenuSelectWasDown_ = false;
+  std::uint64_t handPinchArmFrame_ = 0;
+  std::uint64_t handShapeArmFrame_ = 0;
+  std::uint64_t leftFistArmFrame_ = 0;
+  large::sdf::Vec3 smoothedUiAnchor_{};
+  bool uiAnchorValid_ = false;
+  UiPanelFrame uiFrame_{};
+  bool uiFrameValid_ = false;
   large::sdf::Vec3 worldOffset_{};
   XrTime lastLocomotionTime_ = 0;
   ControllerPose leftGripPose_{};
@@ -5834,6 +6215,7 @@ void main() {
   uint64_t nextSculptFrame_ = 0;
   uint64_t nextSculptLogFrame_ = 0;
   uint64_t nextBrushAdjustLogFrame_ = 0;
+  uint64_t lastBrushAdjustFrame_ = 0;
   uint64_t nextHandLogFrame_ = 0;
   GLuint meshProgram_ = 0;
   GLuint meshVao_ = 0;

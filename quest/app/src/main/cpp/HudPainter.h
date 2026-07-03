@@ -10,6 +10,7 @@
 
 #include <algorithm>
 #include <array>
+#include <cmath>
 #include <cstdint>
 #include <cstring>
 #include <vector>
@@ -17,60 +18,71 @@
 namespace large::hud {
 
 // Panel pixel layout, shared by the painter and the C++ ray hit-testing so
-// what is drawn is exactly what is clickable.
-constexpr int kContentWidth = 264;
-constexpr int kContentHeight = 504;        // full texture height (menu open)
-constexpr int kHeaderVisibleHeight = 128;  // visible height when the menu is closed
-constexpr float kPanelWidthMeters = 0.34f;
+// what is drawn is exactly what is clickable. The menu is paged: a header
+// (always visible), a tab bar and one page at a time, all with large
+// finger-friendly controls.
+constexpr int kContentWidth = 320;
+constexpr int kContentHeight = 544;       // full texture height (menu open)
+constexpr int kHeaderVisibleHeight = 72;  // visible height when the menu is closed
+constexpr float kPanelWidthMeters = 0.38f;
+constexpr int kPanelCornerRadius = 14;
 
-// Header section.
-constexpr int kHeaderLeft = 16;
-constexpr int kHeaderTop = 16;
-constexpr int kHeaderRight = 248;
-constexpr int kHeaderBottom = 112;
-constexpr int kToolBarLeft = 28;
-constexpr int kToolBarTop = 26;
-constexpr int kToolBarRight = 186;
-constexpr int kToolBarBottom = 46;
+// Header: active tool chip + MENU button.
+constexpr int kHeaderChipLeft = 8;
+constexpr int kHeaderChipTop = 10;
+constexpr int kHeaderChipRight = 214;
+constexpr int kHeaderChipBottom = 62;
+constexpr int kMenuButtonLeft = 222;
+constexpr int kMenuButtonTop = 10;
+constexpr int kMenuButtonRight = 312;
+constexpr int kMenuButtonBottom = 62;
 
-// MENU toggle button in the header, reachable by finger poke or by ray.
-constexpr int kMenuButtonLeft = 194;
-constexpr int kMenuButtonTop = 26;
-constexpr int kMenuButtonRight = 242;
-constexpr int kMenuButtonBottom = 46;
-constexpr int kSizeRowY = 54;
-constexpr int kPowerRowY = 74;
-constexpr int kBarLeft = 84;
-constexpr int kBarRight = 204;
-constexpr int kBarHeight = 12;
-constexpr int kFooterY = 96;
+// Tab bar: OUTILS / FICHIERS / COULEUR / PINCEAU.
+constexpr int kTabCount = 4;
+constexpr int kTabTop = 78;
+constexpr int kTabHeight = 46;
+constexpr int kTabFirstLeft = 8;
+constexpr int kTabPitch = 77;
+constexpr int kTabWidth = 73;
 
-// Menu in two columns: the 8 tools on the left, the actions
-// (SAVE/LOAD/EXPORT/QUIT/AR/MIRROR/LOCK) on the right, palette full width
-// below.
-constexpr int kMenuPanelTop = 120;
-constexpr int kMenuPanelBottom = 496;
-constexpr int kMenuRowTop = 132;
-constexpr int kMenuRowPitch = 29;
-constexpr int kMenuRowHeight = 23;
-constexpr int kMenuToolRowCount = 8;
-constexpr int kMenuActionRowCount = 7;
-// Tool column is wider to fit a shape icon left of each label.
-constexpr int kMenuToolColumnLeft = 26;
-constexpr int kMenuToolColumnRight = 146;
-constexpr int kMenuActionColumnLeft = 154;
-constexpr int kMenuActionColumnRight = 238;
-constexpr int kMenuIconCenterOffset = 14;  // icon center X from the column left edge
+// Page TOOLS: 2x4 grid of large buttons.
+constexpr int kToolGridLeft = 8;
+constexpr int kToolGridTop = 136;
+constexpr int kToolButtonWidth = 148;
+constexpr int kToolButtonHeight = 94;
+constexpr int kToolGridPitchX = 156;
+constexpr int kToolGridPitchY = 102;
 
-// Paint palette: a 4x2 grid of large swatches so they are easy to aim at.
-constexpr int kPaletteCount = 8;
-constexpr int kPaletteColumns = 4;
-constexpr int kPaletteRows = 2;
-constexpr int kPaletteLabelY = 376;
-constexpr int kPaletteLeft = 26;
-constexpr int kPaletteTop = 388;
-constexpr int kPaletteSwatch = 44;
-constexpr int kPalettePitch = 52;
+// Page FILES: full-width rows (SAVE/LOAD/EXPORT/AR/LOCK/EXIT).
+constexpr int kFileRowCount = 6;
+constexpr int kFileRowLeft = 8;
+constexpr int kFileRowRight = 312;
+constexpr int kFileRowTop = 140;
+constexpr int kFileRowHeight = 56;
+constexpr int kFileRowPitch = 66;
+
+// Page COLOR: preview bar, saturation/value square, hue bar.
+constexpr int kColorPreviewLeft = 8;
+constexpr int kColorPreviewTop = 140;
+constexpr int kColorPreviewRight = 312;
+constexpr int kColorPreviewBottom = 176;
+constexpr int kSvLeft = 8;
+constexpr int kSvTop = 188;
+constexpr int kSvSize = 240;
+constexpr int kHueLeft = 262;
+constexpr int kHueTop = 188;
+constexpr int kHueWidth = 50;
+constexpr int kHueHeight = 240;
+
+// Page BRUSH: large sliders + mirror toggle + brush preview.
+constexpr int kSliderLeft = 8;
+constexpr int kSliderRight = 312;
+constexpr int kSizeSliderTop = 168;
+constexpr int kPowerSliderTop = 256;
+constexpr int kSliderHeight = 44;
+constexpr int kMirrorButtonTop = 330;
+constexpr int kMirrorButtonBottom = 386;
+constexpr int kBrushPreviewCenterY = 466;
 
 constexpr int kGlyphWidth = 5;
 constexpr int kGlyphHeight = 7;
@@ -179,6 +191,39 @@ class Painter {
         const int dx = x - cx;
         const int dy = y - cy;
         if (dx * dx + dy * dy <= radius * radius) {
+          blendPixel(x, y, c);
+        }
+      }
+    }
+  }
+
+  void fillRoundedRect(int x0, int y0, int x1, int y1, int radius, Color c) {
+    const float halfW = (x1 - x0) * 0.5f - radius;
+    const float halfH = (y1 - y0) * 0.5f - radius;
+    const float cx = (x0 + x1) * 0.5f;
+    const float cy = (y0 + y1) * 0.5f;
+    for (int y = y0; y < y1; ++y) {
+      for (int x = x0; x < x1; ++x) {
+        const float dx = std::max(std::abs(x + 0.5f - cx) - halfW, 0.0f);
+        const float dy = std::max(std::abs(y + 0.5f - cy) - halfH, 0.0f);
+        if (dx * dx + dy * dy <= static_cast<float>(radius) * static_cast<float>(radius)) {
+          blendPixel(x, y, c);
+        }
+      }
+    }
+  }
+
+  void outlineRoundedRect(int x0, int y0, int x1, int y1, int radius, int border, Color c) {
+    const float halfW = (x1 - x0) * 0.5f - radius;
+    const float halfH = (y1 - y0) * 0.5f - radius;
+    const float cx = (x0 + x1) * 0.5f;
+    const float cy = (y0 + y1) * 0.5f;
+    for (int y = y0; y < y1; ++y) {
+      for (int x = x0; x < x1; ++x) {
+        const float dx = std::max(std::abs(x + 0.5f - cx) - halfW, 0.0f);
+        const float dy = std::max(std::abs(y + 0.5f - cy) - halfH, 0.0f);
+        const float d = std::sqrt(dx * dx + dy * dy) - static_cast<float>(radius);
+        if (d <= 0.0f && d >= -static_cast<float>(border)) {
           blendPixel(x, y, c);
         }
       }
