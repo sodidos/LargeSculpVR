@@ -10,6 +10,7 @@ add_library(large_sdf_core
   src/core/ObjExporter.cpp
   src/core/SdfHistory.cpp
   src/core/SdfVolume.cpp
+  src/core/SparseSdfVolume.cpp
   src/core/SurfaceMesh.cpp
 )
 

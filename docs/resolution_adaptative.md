@@ -91,9 +91,13 @@ Un personnage détaillé ~1,2 m dans l'atelier :
 
 ## Plan d'implémentation par étapes (chacune testable)
 
-1. **SparseSdfVolume CPU** derrière l'API actuelle + tests (les brosses et
-   l'undo fonctionnent sans changement d'appelant) — le rendu reçoit
-   provisoirement une texture dense reconstruite (lent mais correct).
+1. **SparseSdfVolume CPU** derrière l'API actuelle + tests. — **FAIT** :
+   `src/core/SparseSdfVolume.{h,cpp}`, briques 32³ à la demande, curseur de
+   brique amortissant les recherches, toutes les brosses portées, parité
+   dense/éparse couverte par les tests (échantillons identiques à ±2 mm sur
+   add/subtract/smooth/flatten/pinch, stretch + restoreRegion inclus), et un
+   blob dans un atelier 256³ logique n'alloue que ~8 briques (≈1 Mo au lieu
+   de 67 Mo).
 2. **Atlas + indirection GPU L0** : le raymarcheur passe au DDA par briques ;
    suppression de la texture dense. Gains de perf immédiats dans le vide.
 3. **Promotion L1** : écriture fine, bordures, affichage deux niveaux.
@@ -102,10 +106,11 @@ Un personnage détaillé ~1,2 m dans l'atelier :
 
 Chaque étape laisse l'application dans un état fonctionnel installable.
 
-## Points ouverts (à trancher ensemble)
+## Décisions (validées)
 
-- Faut-il un indicateur visuel des zones promues (léger liseré au survol) ?
-- La promotion automatique : seuil de rayon proposé = pinceau < 6 cm
-  (objet) ; OK ?
-- Budget briques dur (ex. 256 Mo) avec refus de promotion au-delà + message
-  HUD, ou dépromotion automatique des zones les moins récemment éditées ?
+- Indicateur visuel des zones promues : oui, léger liseré au survol.
+- Promotion automatique : pinceau < 6 cm (objet) ou outils fins
+  (Groove/Crease/Flatten), plus bouton DETAIL explicite.
+- Budget briques dur (256 Mo) avec refus de promotion au-delà et message
+  HUD ; la dépromotion automatique pourra venir plus tard si le besoin
+  apparaît.

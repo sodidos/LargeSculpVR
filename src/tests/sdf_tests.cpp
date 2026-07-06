@@ -9,11 +9,13 @@
 #include "core/ObjExporter.h"
 #include "core/SdfHistory.h"
 #include "core/SdfVolume.h"
+#include "core/SparseSdfVolume.h"
 
 using large::sdf::BrushMode;
 using large::sdf::IVec3;
 using large::sdf::SdfHistory;
 using large::sdf::SdfVolume;
+using large::sdf::SparseSdfVolume;
 using large::sdf::Vec3;
 using large::sdf::VoxelBounds;
 using large::sdf::exportSdfSurfaceAsObj;
@@ -216,6 +218,74 @@ int main() {
       }
     }
     expect(foundColoredVertex, "colored export should write r g b after each vertex");
+  }
+
+  // Sparse brick volume: parity with the dense implementation on the same
+  // operations, and memory proportional to the touched bricks only.
+  {
+    const IVec3 denseSize{64, 64, 64};
+    const float sparseVoxel = 0.05f;
+    const Vec3 sparseOrigin{-1.6f, -1.6f, -1.6f};
+    SdfVolume dense(denseSize, sparseVoxel, sparseOrigin, sparseVoxel * 3.0f);
+    SparseSdfVolume sparse({2, 2, 2}, sparseVoxel, sparseOrigin);  // 64^3 logical
+
+    const auto compareAt = [&](Vec3 p, const char* message) {
+      const float a = dense.sample(p);
+      const float b = sparse.sample(p);
+      expect(std::abs(a - b) < 0.002f, message);
+    };
+
+    dense.applyCapsuleBrush({-0.6f, 0.0f, 0.0f}, {0.6f, 0.0f, 0.0f}, 0.25f, BrushMode::Add, 1.0f);
+    sparse.applyCapsuleBrush({-0.6f, 0.0f, 0.0f}, {0.6f, 0.0f, 0.0f}, 0.25f, BrushMode::Add, 1.0f);
+    compareAt({0.0f, 0.0f, 0.0f}, "sparse capsule add parity (inside)");
+    compareAt({0.0f, 0.22f, 0.0f}, "sparse capsule add parity (near surface)");
+    compareAt({0.7f, 0.0f, 0.0f}, "sparse capsule add parity (cap)");
+
+    dense.applySphereBrush({0.3f, 0.1f, 0.0f}, 0.15f, BrushMode::Subtract, 1.0f);
+    sparse.applySphereBrush({0.3f, 0.1f, 0.0f}, 0.15f, BrushMode::Subtract, 1.0f);
+    compareAt({0.3f, 0.1f, 0.0f}, "sparse subtract parity (carved center)");
+    compareAt({0.3f, -0.1f, 0.0f}, "sparse subtract parity (carve rim)");
+
+    dense.applySmoothBrush({0.3f, 0.05f, 0.0f}, 0.2f, 1.0f);
+    sparse.applySmoothBrush({0.3f, 0.05f, 0.0f}, 0.2f, 1.0f);
+    compareAt({0.3f, 0.05f, 0.0f}, "sparse smooth parity");
+
+    dense.applyFlattenBrush({0.0f, 0.25f, 0.0f}, {0.0f, 0.15f, 0.0f}, {0.0f, 1.0f, 0.0f}, 0.25f, 1.0f);
+    sparse.applyFlattenBrush({0.0f, 0.25f, 0.0f}, {0.0f, 0.15f, 0.0f}, {0.0f, 1.0f, 0.0f}, 0.25f, 1.0f);
+    compareAt({0.0f, 0.20f, 0.0f}, "sparse flatten parity");
+
+    dense.applyPinchBrush({-0.4f, 0.2f, 0.0f}, 0.18f, 1.0f);
+    sparse.applyPinchBrush({-0.4f, 0.2f, 0.0f}, 0.18f, 1.0f);
+    compareAt({-0.4f, 0.2f, 0.0f}, "sparse pinch parity");
+
+    expect(std::abs(dense.countSolidVoxels() - sparse.countSolidVoxels()) <=
+               dense.countSolidVoxels() / 100 + 8,
+           "sparse solid voxel count should match dense within tolerance");
+  }
+
+  // A small blob in a big sparse workspace allocates only a few bricks.
+  {
+    SparseSdfVolume workspace({8, 8, 8}, 0.05f, {-6.4f, -6.4f, -6.4f});  // 256^3 logical
+    workspace.applySphereBrush({0.0f, 0.0f, 0.0f}, 0.2f, BrushMode::Add, 1.0f);
+    expect(workspace.countSolidVoxels() > 0, "sparse blob should have material");
+    expect(workspace.activeBrickCount() <= 27, "small blob should touch few bricks");
+    const std::size_t denseBytes = 256ull * 256ull * 256ull * sizeof(float);
+    expect(workspace.memoryBytes() < denseBytes / 30,
+           "sparse memory should be a tiny fraction of the dense equivalent");
+
+    // Stretch + restoreRegion round-trip on the sparse volume.
+    const SparseSdfVolume snapshot = workspace;
+    const int solidBefore = workspace.countSolidVoxels();
+    workspace.applyStretchBrush(snapshot, {0.18f, 0.0f, 0.0f}, {0.25f, 0.0f, 0.0f},
+                                {1.0f, 0.0f, 0.0f}, {0.0f, 1.0f, 0.0f}, {0.0f, 0.0f, 1.0f}, 0.25f, 1.0f);
+    expect(workspace.sample({0.36f, 0.0f, 0.0f}) < snapshot.sample({0.36f, 0.0f, 0.0f}),
+           "sparse stretch should pull material");
+    VoxelBounds around{};
+    around.valid = true;
+    around.min = {100, 100, 100};
+    around.max = {170, 170, 170};
+    workspace.restoreRegion(snapshot, around);
+    expect(workspace.countSolidVoxels() == solidBefore, "sparse restoreRegion should rewind the stretch");
   }
 
   std::cout << "SDF tests passed\n";
