@@ -261,6 +261,70 @@ void SdfVolume::applyCapsuleBrush(Vec3 start, Vec3 end, float radius, BrushMode 
   markDirtyBounds(minX, minY, minZ, maxX, maxY, maxZ);
 }
 
+void SdfVolume::applyBoxBrush(Vec3 start, Vec3 end, float halfExtent, BrushMode mode, float strength) {
+  if (halfExtent <= 0.0f) {
+    return;
+  }
+  const float amount = clamp(strength, 0.0f, 1.0f);
+  if (amount <= 0.0f) {
+    return;
+  }
+
+  // Sweeping an axis-aligned box along the stroke widens its half-extents by
+  // the stroke's per-axis reach; for the small per-frame segment this is a
+  // box at the current position that grows slightly along the movement.
+  const Vec3 boxCenter = (start + end) * 0.5f;
+  const Vec3 boxHalf{
+      halfExtent + std::abs(end.x - start.x) * 0.5f,
+      halfExtent + std::abs(end.y - start.y) * 0.5f,
+      halfExtent + std::abs(end.z - start.z) * 0.5f,
+  };
+  const float skirt = voxelSize_ * 3.0f;  // soft band outside the box
+
+  const int minX = clampInt(static_cast<int>(std::floor((boxCenter.x - boxHalf.x - skirt - origin_.x) / voxelSize_)), 0, size_.x - 1);
+  const int minY = clampInt(static_cast<int>(std::floor((boxCenter.y - boxHalf.y - skirt - origin_.y) / voxelSize_)), 0, size_.y - 1);
+  const int minZ = clampInt(static_cast<int>(std::floor((boxCenter.z - boxHalf.z - skirt - origin_.z) / voxelSize_)), 0, size_.z - 1);
+  const int maxX = clampInt(static_cast<int>(std::ceil((boxCenter.x + boxHalf.x + skirt - origin_.x) / voxelSize_)), 0, size_.x - 1);
+  const int maxY = clampInt(static_cast<int>(std::ceil((boxCenter.y + boxHalf.y + skirt - origin_.y) / voxelSize_)), 0, size_.y - 1);
+  const int maxZ = clampInt(static_cast<int>(std::ceil((boxCenter.z + boxHalf.z + skirt - origin_.z) / voxelSize_)), 0, size_.z - 1);
+
+  const bool exact = amount >= 0.999f;
+  notifyBeforeEdit(minX, minY, minZ, maxX, maxY, maxZ);
+
+  for (int z = minZ; z <= maxZ; ++z) {
+    for (int y = minY; y <= maxY; ++y) {
+      for (int x = minX; x <= maxX; ++x) {
+        const Vec3 p = voxelCenter(x, y, z);
+        // Signed distance to the axis-aligned box.
+        const Vec3 q{
+            std::abs(p.x - boxCenter.x) - boxHalf.x,
+            std::abs(p.y - boxCenter.y) - boxHalf.y,
+            std::abs(p.z - boxCenter.z) - boxHalf.z,
+        };
+        const Vec3 qOutside{std::max(q.x, 0.0f), std::max(q.y, 0.0f), std::max(q.z, 0.0f)};
+        const float boxDist = length(qOutside) + std::min(std::max(q.x, std::max(q.y, q.z)), 0.0f);
+        const std::size_t i = index(x, y, z);
+        if (exact) {
+          values_[i] = mode == BrushMode::Add ? std::min(values_[i], boxDist) : std::max(values_[i], -boxDist);
+          continue;
+        }
+
+        const float surfDist = std::max(boxDist, 0.0f);
+        const float falloff = 1.0f - smoothstep(0.0f, 1.0f, surfDist / skirt);
+        const float base = clamp(values_[i], -skirt, skirt);
+        if (mode == BrushMode::Add) {
+          const float target = std::min(base, boxDist);
+          values_[i] = base + (target - base) * amount * falloff;
+        } else if (mode == BrushMode::Subtract) {
+          const float target = std::max(base, -boxDist);
+          values_[i] = base + (target - base) * amount * falloff;
+        }
+      }
+    }
+  }
+  markDirtyBounds(minX, minY, minZ, maxX, maxY, maxZ);
+}
+
 void SdfVolume::applyFlattenBrush(Vec3 center, Vec3 planePoint, Vec3 planeNormal, float radius, float strength) {
   if (radius <= 0.0f || strength <= 0.0f) {
     return;

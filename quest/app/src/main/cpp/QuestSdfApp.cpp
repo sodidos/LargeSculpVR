@@ -87,7 +87,15 @@ constexpr int kChoiceHueBar = 31;      // drag: hue bar
 constexpr int kChoiceSizeSlider = 40;  // drag: brush radius
 constexpr int kChoicePowerSlider = 41; // drag: brush strength
 constexpr int kChoiceMirror = 42;
+constexpr int kChoiceShapeSphere = 45;  // brush shape selector
+constexpr int kChoiceShapeCube = 46;
 constexpr int kChoiceMenuToggle = 99;  // MENU header button
+
+// Brush region shape for the material tools (Add / Subtract / Groove).
+enum class BrushShape {
+  Sphere,
+  Cube,
+};
 
 constexpr int kMenuPageTools = 0;
 constexpr int kMenuPageFiles = 1;
@@ -203,6 +211,17 @@ void logError(const char* format, ...) {
   __android_log_vprint(ANDROID_LOG_ERROR, kLogTag, format, args);
   va_end(args);
 }
+
+// GPU brick atlas (adaptive-resolution step 2, plumbing at the current
+// extent, see docs/resolution_adaptative.md). The dense volume stays the
+// source of truth; the renderer consumes a brick atlas view of it. Each 32^3
+// brick is stored in a 34^3 slot with a one-voxel apron on each side so
+// trilinear sampling is seamless across brick faces without reading the
+// neighbor slot. At the current 256^3 extent the 8x8x8 brick grid maps 1:1
+// onto atlas slots (slot coords == brick coords), so no allocator is needed;
+// the sparse allocation arrives with the workspace expansion.
+constexpr int kBrickEdge = 32;
+constexpr int kBrickSlot = kBrickEdge + 2;  // 34 (1-voxel apron each side)
 
 large::sdf::SdfVolume makeInitialVolume() {
   // 256^3 over 4.8 m = 1.875 cm voxels (page-journal undo and box-local
@@ -2304,6 +2323,14 @@ class QuestSdfApp {
         mirrorEnabled_ = !mirrorEnabled_;
         logInfo("Mirror mode %s", mirrorEnabled_ ? "enabled" : "disabled");
         break;
+      case kChoiceShapeSphere:
+        brushShape_ = BrushShape::Sphere;
+        logInfo("Brush shape: sphere");
+        break;
+      case kChoiceShapeCube:
+        brushShape_ = BrushShape::Cube;
+        logInfo("Brush shape: cube");
+        break;
       case kChoiceExit:
         logInfo("Menu EXIT");
         // Ask the runtime to end the session; the state machine then goes
@@ -2763,6 +2790,16 @@ class QuestSdfApp {
         hit.menuChoice = kChoicePowerSlider;
         return true;
       }
+      if (inRect(fragX, fragY, hud::kSliderLeft, hud::kShapeRowTop, hud::kShapeSplitX - 3,
+                 hud::kShapeRowBottom)) {
+        hit.menuChoice = kChoiceShapeSphere;
+        return true;
+      }
+      if (inRect(fragX, fragY, hud::kShapeSplitX + 3, hud::kShapeRowTop, hud::kSliderRight,
+                 hud::kShapeRowBottom)) {
+        hit.menuChoice = kChoiceShapeCube;
+        return true;
+      }
       if (inRect(fragX, fragY, hud::kSliderLeft, hud::kMirrorButtonTop, hud::kSliderRight,
                  hud::kMirrorButtonBottom)) {
         hit.menuChoice = kChoiceMirror;
@@ -3110,19 +3147,30 @@ class QuestSdfApp {
                           large::sdf::Vec3 flattenNormal,
                           float localBrushRadius,
                           float strength) {
+    const bool cube = brushShape_ == BrushShape::Cube;
     switch (activeTool_) {
       case VrTool::Add:
-        volume_.applyCapsuleBrush(from, centerLocal, localBrushRadius, large::sdf::BrushMode::Add,
-                                  scaledCsgStrength(strength));
+        if (cube) {
+          volume_.applyBoxBrush(from, centerLocal, localBrushRadius, large::sdf::BrushMode::Add,
+                                scaledCsgStrength(strength));
+        } else {
+          volume_.applyCapsuleBrush(from, centerLocal, localBrushRadius, large::sdf::BrushMode::Add,
+                                    scaledCsgStrength(strength));
+        }
         // Added material comes in the selected paint color. The paint radius
-        // extends a couple of voxels past the capsule so the air shell around
+        // extends a couple of voxels past the stroke so the air shell around
         // the new surface is tinted too: the trilinear color filter would
         // otherwise blend untouched clay into the fresh surface.
         applyPaintStroke(from, centerLocal, localBrushRadius + volume_.voxelSize() * 2.5f, 1.0f, true);
         break;
       case VrTool::Subtract:
-        volume_.applyCapsuleBrush(from, centerLocal, localBrushRadius, large::sdf::BrushMode::Subtract,
-                                  scaledCsgStrength(strength));
+        if (cube) {
+          volume_.applyBoxBrush(from, centerLocal, localBrushRadius, large::sdf::BrushMode::Subtract,
+                                scaledCsgStrength(strength));
+        } else {
+          volume_.applyCapsuleBrush(from, centerLocal, localBrushRadius, large::sdf::BrushMode::Subtract,
+                                    scaledCsgStrength(strength));
+        }
         break;
       case VrTool::Smooth:
         volume_.applySmoothBrush(centerLocal, localBrushRadius * 1.35f,
@@ -3132,13 +3180,17 @@ class QuestSdfApp {
         volume_.applyFlattenBrush(centerLocal, flattenPoint, flattenNormal, localBrushRadius * 1.25f,
                                   strength * kGlobalStrengthScale);
         break;
-      case VrTool::Groove:
-        volume_.applyCapsuleBrush(from,
-                                  centerLocal,
-                                  std::max(localBrushRadius * 0.35f, volume_.voxelSize()),
-                                  large::sdf::BrushMode::Subtract,
-                                  scaledCsgStrength(strength));
+      case VrTool::Groove: {
+        const float grooveRadius = std::max(localBrushRadius * 0.35f, volume_.voxelSize());
+        if (cube) {
+          volume_.applyBoxBrush(from, centerLocal, grooveRadius, large::sdf::BrushMode::Subtract,
+                                scaledCsgStrength(strength));
+        } else {
+          volume_.applyCapsuleBrush(from, centerLocal, grooveRadius, large::sdf::BrushMode::Subtract,
+                                    scaledCsgStrength(strength));
+        }
         break;
+      }
       case VrTool::Crease:
         volume_.applyPinchBrush(centerLocal, localBrushRadius, strength * kGlobalStrengthScale);
         break;
@@ -4024,60 +4076,8 @@ class QuestSdfApp {
     }
 
     bounds = clampVoxelBounds(bounds, size);
+    updateBrickAtlas(bounds);
 
-    const int width = bounds.max.x - bounds.min.x + 1;
-    const int height = bounds.max.y - bounds.min.y + 1;
-    const int depth = bounds.max.z - bounds.min.z + 1;
-    const int totalVoxels = size.x * size.y * size.z;
-    const int uploadVoxels = width * height * depth;
-    const bool uploadFull = uploadVoxels * 4 >= totalVoxels * 3;
-
-    glBindTexture(GL_TEXTURE_3D, sdfTexture_);
-    glPixelStorei(GL_UNPACK_ALIGNMENT, 1);
-    if (uploadFull) {
-      glTexSubImage3D(GL_TEXTURE_3D,
-                      0,
-                      0,
-                      0,
-                      0,
-                      size.x,
-                      size.y,
-                      size.z,
-                      GL_RED,
-                      GL_FLOAT,
-                      volume_.values().data());
-    } else {
-      uploadScratch_.resize(static_cast<std::size_t>(uploadVoxels));
-      const float* values = volume_.values().data();
-      float* packed = uploadScratch_.data();
-      for (int z = 0; z < depth; ++z) {
-        for (int y = 0; y < height; ++y) {
-          const std::size_t sourceIndex = volume_.index(bounds.min.x, bounds.min.y + y, bounds.min.z + z);
-          const std::size_t destinationIndex =
-              (static_cast<std::size_t>(z) * static_cast<std::size_t>(height) + static_cast<std::size_t>(y)) *
-              static_cast<std::size_t>(width);
-          std::copy_n(values + sourceIndex, width, packed + destinationIndex);
-        }
-      }
-
-      glTexSubImage3D(GL_TEXTURE_3D,
-                      0,
-                      bounds.min.x,
-                      bounds.min.y,
-                      bounds.min.z,
-                      width,
-                      height,
-                      depth,
-                      GL_RED,
-                      GL_FLOAT,
-                      packed);
-    }
-    const GLenum uploadError = glGetError();
-    glBindTexture(GL_TEXTURE_3D, 0);
-    if (uploadError != GL_NO_ERROR) {
-      logError("SDF texture sub upload failed: 0x%x, box=%dx%dx%d", uploadError, width, height, depth);
-      return;
-    }
     if (isFullVoxelBounds(bounds, size)) {
       recomputeSdfRenderBounds("recomputed");
     } else {
@@ -4298,7 +4298,10 @@ precision highp sampler3D;
 in vec2 vUv;
 out vec4 oColor;
 
-uniform sampler3D uSdf;
+uniform sampler3D uSdf;            // brick distance atlas (34^3 apron'd slots)
+uniform highp usampler3D uIndir;  // per-brick occupancy (1 = contains surface)
+uniform vec3 uAtlasDim;           // atlas texel dimensions
+uniform ivec3 uBrickGrid;         // bricks per axis
 uniform sampler3D uColorVol;
 uniform vec3 uCameraPos;
 uniform mat3 uViewRotation;
@@ -4400,8 +4403,17 @@ vec3 applyVolumeBoundsCube(vec3 color, vec2 uv, float sceneDepth, inout float sc
 }
 
 float sampleSdfLocal(vec3 localPoint) {
-  vec3 uv = (localPoint - uVolumeMin) / uVolumeExtent;
-  float field = texture(uSdf, clamp(uv, vec3(0.0), vec3(1.0))).r;
+  // Map the local point to its brick, then to the apron'd atlas slot. Because
+  // bricks map 1:1 to slots at this extent, the slot origin is bc*34; core
+  // voxel i sits at slot texel i+1, so the sample texel is bc*34 + localVox +
+  // 1.5 (the +0.5 is the texel-center convention). floor() keeps localVox in
+  // [0,32), so trilinear taps stay within [slot, slot+apron] and never bleed
+  // into the neighbor slot.
+  vec3 voxf = (localPoint - uVolumeMin) / uVoxelSize;
+  ivec3 bc = clamp(ivec3(floor(voxf / float(32))), ivec3(0), uBrickGrid - ivec3(1));
+  vec3 localVox = clamp(voxf - vec3(bc) * 32.0, vec3(0.0), vec3(31.9999));
+  vec3 atlasTexel = vec3(bc) * 34.0 + localVox + 1.5;
+  float field = texture(uSdf, atlasTexel / uAtlasDim).r;
   // Intersect the field with the workspace box so material reaching the
   // volume limits is capped by a flat face instead of appearing open.
   vec3 boxCenter = uVolumeMin + uVolumeExtent * 0.5;
@@ -4409,6 +4421,21 @@ float sampleSdfLocal(vec3 localPoint) {
   vec3 q = abs(localPoint - boxCenter) - boxHalf;
   float boxDistance = length(max(q, vec3(0.0))) + min(max(q.x, max(q.y, q.z)), 0.0);
   return max(field, boxDistance);
+}
+
+// Distance to exit the current brick when it holds no surface, so the ray
+// jumps over empty space in one step instead of crawling voxel by voxel.
+float emptyBrickSkip(vec3 localPoint, vec3 rayDirLocal) {
+  vec3 voxf = (localPoint - uVolumeMin) / uVoxelSize;
+  ivec3 bc = clamp(ivec3(floor(voxf / float(32))), ivec3(0), uBrickGrid - ivec3(1));
+  if (texelFetch(uIndir, bc, 0).r != 0u) {
+    return 0.0;
+  }
+  vec3 bmin = uVolumeMin + vec3(bc) * (32.0 * uVoxelSize);
+  vec3 bmax = bmin + vec3(32.0 * uVoxelSize);
+  vec3 inv = 1.0 / rayDirLocal;
+  vec3 tHigh = max((bmin - localPoint) * inv, (bmax - localPoint) * inv);
+  return max(min(min(tHigh.x, tHigh.y), tHigh.z), 0.0);
 }
 
 vec3 estimateNormalLocal(vec3 localPoint) {
@@ -4600,6 +4627,15 @@ vec3 shadeUv(vec2 uv, out float sceneDepth, out float sceneAlpha) {
 
   for (int i = 0; i < 160; ++i) {
     localP = rayOriginLocal + rayDirLocal * t;
+    float skip = emptyBrickSkip(localP, rayDirLocal);
+    if (skip > 0.0) {
+      t += skip + uVoxelSize * 0.5;
+      hasPrevious = false;  // no sign-change interpolation across a jump
+      if (t > hit.y) {
+        break;
+      }
+      continue;
+    }
     float d = sampleSdfLocal(localP);
     if (abs(d) < surface) {
       found = true;
@@ -4714,19 +4750,30 @@ void main() {
     sdfArEnabledLocation_ = glGetUniformLocation(sdfProgram_, "uArEnabled");
     sdfWorldOffsetLocation_ = glGetUniformLocation(sdfProgram_, "uWorldOffset");
     sdfVoxelSizeLocation_ = glGetUniformLocation(sdfProgram_, "uVoxelSize");
+    sdfAtlasDimLocation_ = glGetUniformLocation(sdfProgram_, "uAtlasDim");
+    sdfBrickGridLocation_ = glGetUniformLocation(sdfProgram_, "uBrickGrid");
     const GLint samplerLocation = glGetUniformLocation(sdfProgram_, "uSdf");
     const GLint colorSamplerLocation = glGetUniformLocation(sdfProgram_, "uColorVol");
+    const GLint indirSamplerLocation = glGetUniformLocation(sdfProgram_, "uIndir");
     if (sdfCameraLocation_ < 0 || sdfViewRotationLocation_ < 0 || sdfFovTangentsLocation_ < 0 ||
         sdfVolumeMinLocation_ < 0 || sdfVolumeExtentLocation_ < 0 || sdfObjectPosLocation_ < 0 ||
         sdfRenderMinLocation_ < 0 || sdfRenderExtentLocation_ < 0 ||
         sdfObjectRotationLocation_ < 0 || sdfObjectInvRotationLocation_ < 0 || sdfObjectScaleLocation_ < 0 ||
         sdfArEnabledLocation_ < 0 || sdfWorldOffsetLocation_ < 0 || sdfVoxelSizeLocation_ < 0 ||
-        samplerLocation < 0 || colorSamplerLocation < 0) {
+        sdfAtlasDimLocation_ < 0 || sdfBrickGridLocation_ < 0 ||
+        samplerLocation < 0 || colorSamplerLocation < 0 || indirSamplerLocation < 0) {
       logError("SDF raymarch shader uniforms are missing");
       return false;
     }
 
     const large::sdf::IVec3 size = volume_.size();
+    brickGrid_ = {size.x / kBrickEdge, size.y / kBrickEdge, size.z / kBrickEdge};
+    const int atlasDimX = brickGrid_.x * kBrickSlot;
+    const int atlasDimY = brickGrid_.y * kBrickSlot;
+    const int atlasDimZ = brickGrid_.z * kBrickSlot;
+
+    // Brick distance atlas: allocated undefined, then fully written by the
+    // initial updateBrickAtlas() below (every brick is uploaded once).
     glGenTextures(1, &sdfTexture_);
     glBindTexture(GL_TEXTURE_3D, sdfTexture_);
     glTexParameteri(GL_TEXTURE_3D, GL_TEXTURE_MIN_FILTER, GL_LINEAR);
@@ -4735,25 +4782,40 @@ void main() {
     glTexParameteri(GL_TEXTURE_3D, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE);
     glTexParameteri(GL_TEXTURE_3D, GL_TEXTURE_WRAP_R, GL_CLAMP_TO_EDGE);
     glPixelStorei(GL_UNPACK_ALIGNMENT, 1);
-    glTexImage3D(GL_TEXTURE_3D,
-                 0,
-                 GL_R32F,
-                 size.x,
-                 size.y,
-                 size.z,
-                 0,
-                 GL_RED,
-                 GL_FLOAT,
-                 volume_.values().data());
+    glTexImage3D(GL_TEXTURE_3D, 0, GL_R32F, atlasDimX, atlasDimY, atlasDimZ, 0, GL_RED, GL_FLOAT, nullptr);
+    glBindTexture(GL_TEXTURE_3D, 0);
+
+    // Per-brick occupancy (integer, nearest-only). 0 = no surface -> skipped.
+    glGenTextures(1, &indirTexture_);
+    glBindTexture(GL_TEXTURE_3D, indirTexture_);
+    glTexParameteri(GL_TEXTURE_3D, GL_TEXTURE_MIN_FILTER, GL_NEAREST);
+    glTexParameteri(GL_TEXTURE_3D, GL_TEXTURE_MAG_FILTER, GL_NEAREST);
+    glTexParameteri(GL_TEXTURE_3D, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE);
+    glTexParameteri(GL_TEXTURE_3D, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE);
+    glTexParameteri(GL_TEXTURE_3D, GL_TEXTURE_WRAP_R, GL_CLAMP_TO_EDGE);
+    std::vector<std::uint32_t> indirZero(
+        static_cast<std::size_t>(brickGrid_.x) * brickGrid_.y * brickGrid_.z, 0u);
+    glTexImage3D(GL_TEXTURE_3D, 0, GL_R32UI, brickGrid_.x, brickGrid_.y, brickGrid_.z, 0, GL_RED_INTEGER,
+                 GL_UNSIGNED_INT, indirZero.data());
     glBindTexture(GL_TEXTURE_3D, 0);
 
     const GLenum textureError = glGetError();
     if (textureError != GL_NO_ERROR) {
-      logError("SDF 3D texture upload failed: 0x%x", textureError);
+      logError("SDF brick atlas allocation failed: 0x%x (atlas %dx%dx%d)", textureError, atlasDimX, atlasDimY,
+               atlasDimZ);
       return false;
     }
+
+    // Fill the atlas from the whole volume (writes every brick slot once).
+    large::sdf::VoxelBounds fullBounds{};
+    fullBounds.valid = true;
+    fullBounds.min = {0, 0, 0};
+    fullBounds.max = {size.x - 1, size.y - 1, size.z - 1};
+    updateBrickAtlas(fullBounds);
     volume_.clearDirtyBounds();
     recomputeSdfRenderBounds("initial");
+    logInfo("Brick atlas ready: grid %dx%dx%d, atlas %dx%dx%d texels", brickGrid_.x, brickGrid_.y, brickGrid_.z,
+            atlasDimX, atlasDimY, atlasDimZ);
 
     initializeColorVoxels();
     glGenTextures(1, &colorTexture_);
@@ -4787,10 +4849,74 @@ void main() {
     glUseProgram(sdfProgram_);
     glUniform1i(samplerLocation, 0);
     glUniform1i(colorSamplerLocation, 1);
+    glUniform1i(indirSamplerLocation, 2);
+    glUniform3f(sdfAtlasDimLocation_, static_cast<float>(atlasDimX), static_cast<float>(atlasDimY),
+                static_cast<float>(atlasDimZ));
+    glUniform3i(sdfBrickGridLocation_, brickGrid_.x, brickGrid_.y, brickGrid_.z);
     glUseProgram(0);
 
-    logInfo("SDF raymarch renderer ready: %dx%dx%d texture + color volume", size.x, size.y, size.z);
+    logInfo("SDF raymarch renderer ready: brick atlas + color volume (%dx%dx%d)", size.x, size.y, size.z);
     return true;
+  }
+
+  // Rebuilds and uploads the atlas slots for every brick overlapping the
+  // dirty region (expanded by one voxel so each brick's apron picks up
+  // neighbor changes), and refreshes their occupancy flags. Reads come from
+  // the dense volume, which stays the source of truth.
+  void updateBrickAtlas(large::sdf::VoxelBounds bounds) {
+    if (sdfTexture_ == 0 || indirTexture_ == 0 || !bounds.valid) {
+      return;
+    }
+    const large::sdf::IVec3 size = volume_.size();
+    const int loMinX = std::max(bounds.min.x - 1, 0);
+    const int loMinY = std::max(bounds.min.y - 1, 0);
+    const int loMinZ = std::max(bounds.min.z - 1, 0);
+    const int hiMaxX = std::min(bounds.max.x + 1, size.x - 1);
+    const int hiMaxY = std::min(bounds.max.y + 1, size.y - 1);
+    const int hiMaxZ = std::min(bounds.max.z + 1, size.z - 1);
+    const int minBX = loMinX / kBrickEdge;
+    const int minBY = loMinY / kBrickEdge;
+    const int minBZ = loMinZ / kBrickEdge;
+    const int maxBX = std::min(hiMaxX / kBrickEdge, brickGrid_.x - 1);
+    const int maxBY = std::min(hiMaxY / kBrickEdge, brickGrid_.y - 1);
+    const int maxBZ = std::min(hiMaxZ / kBrickEdge, brickGrid_.z - 1);
+
+    const float band = volume_.voxelSize() * 4.0f;
+    brickScratch_.resize(static_cast<std::size_t>(kBrickSlot) * kBrickSlot * kBrickSlot);
+    glPixelStorei(GL_UNPACK_ALIGNMENT, 1);
+
+    for (int bz = minBZ; bz <= maxBZ; ++bz) {
+      for (int by = minBY; by <= maxBY; ++by) {
+        for (int bx = minBX; bx <= maxBX; ++bx) {
+          bool occupied = false;
+          float* dst = brickScratch_.data();
+          for (int sz = 0; sz < kBrickSlot; ++sz) {
+            const int wz = bz * kBrickEdge + sz - 1;
+            for (int sy = 0; sy < kBrickSlot; ++sy) {
+              const int wy = by * kBrickEdge + sy - 1;
+              for (int sx = 0; sx < kBrickSlot; ++sx) {
+                const int wx = bx * kBrickEdge + sx - 1;
+                const float v = volume_.value(wx, wy, wz);
+                *dst++ = v;
+                if (sx >= 1 && sx <= kBrickEdge && sy >= 1 && sy <= kBrickEdge && sz >= 1 && sz <= kBrickEdge &&
+                    std::abs(v) <= band) {
+                  occupied = true;
+                }
+              }
+            }
+          }
+
+          glBindTexture(GL_TEXTURE_3D, sdfTexture_);
+          glTexSubImage3D(GL_TEXTURE_3D, 0, bx * kBrickSlot, by * kBrickSlot, bz * kBrickSlot, kBrickSlot,
+                          kBrickSlot, kBrickSlot, GL_RED, GL_FLOAT, brickScratch_.data());
+
+          const std::uint32_t occ = occupied ? 1u : 0u;
+          glBindTexture(GL_TEXTURE_3D, indirTexture_);
+          glTexSubImage3D(GL_TEXTURE_3D, 0, bx, by, bz, 1, 1, 1, GL_RED_INTEGER, GL_UNSIGNED_INT, &occ);
+        }
+      }
+    }
+    glBindTexture(GL_TEXTURE_3D, 0);
   }
 
   void renderSdfRaymarchForEye(int eye) {
@@ -4839,6 +4965,8 @@ void main() {
     glUniform3f(sdfWorldOffsetLocation_, worldOffset_.x, worldOffset_.y, worldOffset_.z);
     glUniform1f(sdfVoxelSizeLocation_, volume_.voxelSize());
 
+    glActiveTexture(GL_TEXTURE2);
+    glBindTexture(GL_TEXTURE_3D, indirTexture_);
     glActiveTexture(GL_TEXTURE1);
     glBindTexture(GL_TEXTURE_3D, colorTexture_);
     glActiveTexture(GL_TEXTURE0);
@@ -4848,6 +4976,8 @@ void main() {
     glBindVertexArray(0);
     glBindTexture(GL_TEXTURE_3D, 0);
     glActiveTexture(GL_TEXTURE1);
+    glBindTexture(GL_TEXTURE_3D, 0);
+    glActiveTexture(GL_TEXTURE2);
     glBindTexture(GL_TEXTURE_3D, 0);
     glActiveTexture(GL_TEXTURE0);
     glUseProgram(0);
@@ -5492,6 +5622,7 @@ void main() {
     bool arAvailable = false;
     bool mirrorEnabled = false;
     bool lockEnabled = false;
+    bool shapeCube = false;
     float hue = 0.0f;
     float sat = 0.0f;
     float val = 0.0f;
@@ -5501,7 +5632,8 @@ void main() {
       return toolIndex == other.toolIndex && page == other.page && radius == other.radius &&
              strength == other.strength && menuVisible == other.menuVisible && hoverIndex == other.hoverIndex &&
              arEnabled == other.arEnabled && arAvailable == other.arAvailable &&
-             mirrorEnabled == other.mirrorEnabled && lockEnabled == other.lockEnabled && hue == other.hue &&
+             mirrorEnabled == other.mirrorEnabled && lockEnabled == other.lockEnabled &&
+             shapeCube == other.shapeCube && hue == other.hue &&
              sat == other.sat && val == other.val && triggerPressed == other.triggerPressed;
     }
   };
@@ -5777,6 +5909,19 @@ void main() {
                         hud::kPowerSliderTop + hud::kSliderHeight - 14, 8, {255, 153, 61, 255});
       p.fillCircle(powerKnobX, hud::kPowerSliderTop + hud::kSliderHeight / 2, 16, textMain);
 
+      // SHAPE selector: SPHERE | CUBE.
+      const int shapeMidY = (hud::kShapeRowTop + hud::kShapeRowBottom) / 2;
+      const bool sphereActive = !snap.shapeCube;
+      const bool sphereHover = snap.hoverIndex == kChoiceShapeSphere;
+      p.fillRoundedRect(hud::kSliderLeft, hud::kShapeRowTop, hud::kShapeSplitX - 3, hud::kShapeRowBottom, 10,
+                        sphereActive ? accent : (sphereHover ? cardHover : cardBg));
+      p.drawTextCentered((hud::kSliderLeft + hud::kShapeSplitX - 3) / 2, shapeMidY - 7, "SPHERE", 2, textMain);
+      const bool cubeActive = snap.shapeCube;
+      const bool cubeHover = snap.hoverIndex == kChoiceShapeCube;
+      p.fillRoundedRect(hud::kShapeSplitX + 3, hud::kShapeRowTop, hud::kSliderRight, hud::kShapeRowBottom, 10,
+                        cubeActive ? accent : (cubeHover ? cardHover : cardBg));
+      p.drawTextCentered((hud::kShapeSplitX + 3 + hud::kSliderRight) / 2, shapeMidY - 7, "CUBE", 2, textMain);
+
       // MIRROR toggle.
       const bool mirrorHovered = snap.hoverIndex == kChoiceMirror;
       p.fillRoundedRect(hud::kSliderLeft, hud::kMirrorButtonTop, hud::kSliderRight, hud::kMirrorButtonBottom, 10,
@@ -5790,9 +5935,17 @@ void main() {
       p.drawTextCentered((hud::kSliderLeft + hud::kSliderRight) / 2,
                          (hud::kMirrorButtonTop + hud::kMirrorButtonBottom) / 2 - 7, mirrorLabel, 2, textMain);
 
-      // Brush size preview circle.
-      const int previewRadius = 14 + static_cast<int>(sizeT * 54.0f);
-      p.ring(hud::kContentWidth / 2, hud::kBrushPreviewCenterY, previewRadius, 3, toolUiColor(snap.toolIndex));
+      // Brush size preview: a square for the cube shape, a ring otherwise.
+      const int previewRadius = 12 + static_cast<int>(sizeT * 40.0f);
+      const int cx = hud::kContentWidth / 2;
+      const int cy = hud::kBrushPreviewCenterY;
+      const hud::Color previewColor = toolUiColor(snap.toolIndex);
+      if (snap.shapeCube) {
+        p.outlineRect(cx - previewRadius, cy - previewRadius, cx + previewRadius, cy + previewRadius, 3,
+                      previewColor);
+      } else {
+        p.ring(cx, cy, previewRadius, 3, previewColor);
+      }
     }
   }
 
@@ -5811,6 +5964,7 @@ void main() {
     snap.arEnabled = arModeEnabled_;
     snap.arAvailable = passthroughReady_;
     snap.mirrorEnabled = mirrorEnabled_;
+    snap.shapeCube = brushShape_ == BrushShape::Cube;
     snap.lockEnabled = objectLocked_;
     snap.hue = paintHue_;
     snap.sat = paintSat_;
@@ -6003,6 +6157,10 @@ void main() {
       glDeleteTextures(1, &sdfTexture_);
       sdfTexture_ = 0;
     }
+    if (indirTexture_ != 0) {
+      glDeleteTextures(1, &indirTexture_);
+      indirTexture_ = 0;
+    }
     if (colorTexture_ != 0) {
       glDeleteTextures(1, &colorTexture_);
       colorTexture_ = 0;
@@ -6149,7 +6307,10 @@ void main() {
   GLuint depthBuffer_ = 0;
   GLuint sdfProgram_ = 0;
   GLuint sdfVao_ = 0;
-  GLuint sdfTexture_ = 0;
+  GLuint sdfTexture_ = 0;       // brick distance atlas
+  GLuint indirTexture_ = 0;     // per-brick occupancy
+  large::sdf::IVec3 brickGrid_{};
+  std::vector<float> brickScratch_;
   GLuint colorTexture_ = 0;
   GLuint hudTexture_ = 0;
   std::vector<float> uploadScratch_;
@@ -6180,6 +6341,8 @@ void main() {
   GLint sdfArEnabledLocation_ = -1;
   GLint sdfWorldOffsetLocation_ = -1;
   GLint sdfVoxelSizeLocation_ = -1;
+  GLint sdfAtlasDimLocation_ = -1;
+  GLint sdfBrickGridLocation_ = -1;
   GLint uiCameraLocation_ = -1;
   GLint uiViewRotationLocation_ = -1;
   GLint uiFovTangentsLocation_ = -1;
@@ -6312,6 +6475,7 @@ void main() {
   large::sdf::Vec3 flattenPreviewCenterWorld_{};
   large::sdf::Vec3 flattenPreviewNormalWorld_{0.0f, 1.0f, 0.0f};
   bool mirrorEnabled_ = false;
+  BrushShape brushShape_ = BrushShape::Sphere;
   bool objectLocked_ = false;
   bool handMenuSelectWasDown_ = false;
   std::uint64_t handPinchArmFrame_ = 0;

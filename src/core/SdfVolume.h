@@ -61,6 +61,9 @@ class SdfVolume {
   void applySphereBrush(Vec3 center, float radius, BrushMode mode);
   void applySphereBrush(Vec3 center, float radius, BrushMode mode, float strength);
   void applyCapsuleBrush(Vec3 start, Vec3 end, float radius, BrushMode mode, float strength);
+  // Axis-aligned box brush swept along the stroke: sharp corners for
+  // hard-surface blocks and grooves. halfExtent is the cube half-width.
+  void applyBoxBrush(Vec3 start, Vec3 end, float halfExtent, BrushMode mode, float strength);
   void applyFlattenBrush(Vec3 center, Vec3 planePoint, Vec3 planeNormal, float radius, float strength);
   void applyPinchBrush(Vec3 center, float radius, float strength);
   void applySmoothBrush(Vec3 center, float radius, float strength);

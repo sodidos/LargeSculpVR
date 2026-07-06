@@ -95,6 +95,16 @@ int main() {
   expect(flattenProbe.sample({0.0f, 0.30f, 0.0f}) > 0.0f, "flatten should shave the bump above the plane");
   expect(flattenProbe.sample({0.0f, 0.10f, 0.0f}) < 0.0f, "flatten should keep material below the plane");
 
+  SdfVolume boxProbe({32, 32, 32}, 0.05f, origin, 10.0f);
+  boxProbe.applyBoxBrush({0.0f, 0.0f, 0.0f}, {0.0f, 0.0f, 0.0f}, 0.20f, BrushMode::Add, 1.0f);
+  expect(boxProbe.sample({0.0f, 0.0f, 0.0f}) < 0.0f, "box add should fill the center");
+  // A cube reaches into its corners where a sphere of the same half-width would not.
+  expect(boxProbe.sample({0.18f, 0.18f, 0.18f}) < 0.0f, "box add should fill toward the corner");
+  expect(boxProbe.sample({0.30f, 0.0f, 0.0f}) > 0.0f, "box add should stop past the half-extent");
+  const int boxSolid = boxProbe.countSolidVoxels();
+  boxProbe.applyBoxBrush({0.0f, 0.0f, 0.0f}, {0.0f, 0.0f, 0.0f}, 0.08f, BrushMode::Subtract, 1.0f);
+  expect(boxProbe.countSolidVoxels() < boxSolid, "box subtract should carve a cubic cavity");
+
   SdfVolume pinchProbe({32, 32, 32}, 0.05f, origin, 10.0f);
   pinchProbe.fillSphere({0.0f, 0.0f, 0.0f}, 0.35f);
   const int pinchSolidBefore = pinchProbe.countSolidVoxels();

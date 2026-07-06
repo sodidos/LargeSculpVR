@@ -74,15 +74,18 @@ constexpr int kHueTop = 188;
 constexpr int kHueWidth = 50;
 constexpr int kHueHeight = 240;
 
-// Page BRUSH: large sliders + mirror toggle + brush preview.
+// Page BRUSH: large sliders + shape selector + mirror toggle + preview.
 constexpr int kSliderLeft = 8;
 constexpr int kSliderRight = 312;
-constexpr int kSizeSliderTop = 168;
-constexpr int kPowerSliderTop = 256;
+constexpr int kSizeSliderTop = 150;
+constexpr int kPowerSliderTop = 226;
 constexpr int kSliderHeight = 44;
-constexpr int kMirrorButtonTop = 330;
-constexpr int kMirrorButtonBottom = 386;
-constexpr int kBrushPreviewCenterY = 466;
+constexpr int kShapeRowTop = 300;
+constexpr int kShapeRowBottom = 348;
+constexpr int kShapeSplitX = 160;  // sphere button left of this, cube right
+constexpr int kMirrorButtonTop = 360;
+constexpr int kMirrorButtonBottom = 408;
+constexpr int kBrushPreviewCenterY = 476;
 
 constexpr int kGlyphWidth = 5;
 constexpr int kGlyphHeight = 7;
