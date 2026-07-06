@@ -9,12 +9,14 @@
 #include "core/ObjExporter.h"
 #include "core/SdfHistory.h"
 #include "core/SdfVolume.h"
+#include "core/SparseSdfHistory.h"
 #include "core/SparseSdfVolume.h"
 
 using large::sdf::BrushMode;
 using large::sdf::IVec3;
 using large::sdf::SdfHistory;
 using large::sdf::SdfVolume;
+using large::sdf::SparseSdfHistory;
 using large::sdf::SparseSdfVolume;
 using large::sdf::Vec3;
 using large::sdf::VoxelBounds;
@@ -296,6 +298,38 @@ int main() {
     around.max = {170, 170, 170};
     workspace.restoreRegion(snapshot, around);
     expect(workspace.countSolidVoxels() == solidBefore, "sparse restoreRegion should rewind the stretch");
+  }
+
+  // Sparse history: strokes in different bricks undo in order, bricks the
+  // stroke created are removed on undo, and memory stays proportional to the
+  // touched bricks.
+  {
+    SparseSdfVolume histProbe({8, 8, 8}, 0.05f, {-6.4f, -6.4f, -6.4f});  // 256^3 logical
+    SparseSdfHistory hist(histProbe);
+
+    hist.capture();
+    histProbe.applySphereBrush({-2.0f, 0.0f, 0.0f}, 0.20f, BrushMode::Add, 1.0f);
+    const int afterFirst = histProbe.countSolidVoxels();
+    const std::size_t bricksAfterFirst = histProbe.activeBrickCount();
+    expect(afterFirst > 0, "sparse history: first stroke adds material");
+
+    hist.capture();
+    histProbe.applySphereBrush({2.0f, 0.0f, 0.0f}, 0.20f, BrushMode::Add, 1.0f);
+    expect(histProbe.activeBrickCount() > bricksAfterFirst, "second stroke allocates more bricks");
+    expect(hist.totalBytes() < 256ull * 256ull * 256ull * sizeof(float) / 20,
+           "sparse history stores only touched bricks");
+
+    expect(hist.undo(), "sparse undo second stroke");
+    expect(histProbe.countSolidVoxels() == afterFirst, "second stroke undone");
+    expect(histProbe.activeBrickCount() == bricksAfterFirst,
+           "bricks created by the second stroke are removed on undo");
+    expect(hist.lastChangedBounds().valid, "sparse undo reports changed bounds");
+
+    expect(hist.undo(), "sparse undo first stroke");
+    expect(histProbe.countSolidVoxels() == 0, "first stroke undone -> empty");
+
+    expect(hist.redo() && hist.redo(), "sparse redo both strokes");
+    expect(histProbe.countSolidVoxels() > afterFirst, "both strokes redone");
   }
 
   std::cout << "SDF tests passed\n";

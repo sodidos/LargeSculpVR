@@ -14,6 +14,7 @@ add_library(large_sdf_core STATIC
     "${REPO_ROOT}/src/core/ObjExporter.cpp"
     "${REPO_ROOT}/src/core/SdfHistory.cpp"
     "${REPO_ROOT}/src/core/SdfVolume.cpp"
+    "${REPO_ROOT}/src/core/SparseSdfHistory.cpp"
     "${REPO_ROOT}/src/core/SparseSdfVolume.cpp"
     "${REPO_ROOT}/src/core/SurfaceMesh.cpp"
 )

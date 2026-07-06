@@ -171,6 +171,7 @@ void SparseSdfVolume::applyCapsuleBrush(Vec3 start, Vec3 end, float radius, Brus
   const int maxZ = clampInt(static_cast<int>(std::ceil((std::max(start.z, end.z) + influence - origin_.z) / voxelSize_)), 0, size_.z - 1);
 
   const bool exact = amount >= 0.999f;
+  notifyBeforeEdit(minX, minY, minZ, maxX, maxY, maxZ);
   ConstCursor readCursor;
   Cursor writeCursor;
 
@@ -222,6 +223,7 @@ void SparseSdfVolume::applyFlattenBrush(Vec3 center, Vec3 planePoint, Vec3 plane
   const int maxY = clampInt(static_cast<int>(std::ceil((center.y + radius - origin_.y) / voxelSize_)), 0, size_.y - 1);
   const int maxZ = clampInt(static_cast<int>(std::ceil((center.z + radius - origin_.z) / voxelSize_)), 0, size_.z - 1);
 
+  notifyBeforeEdit(minX, minY, minZ, maxX, maxY, maxZ);
   ConstCursor readCursor;
   Cursor writeCursor;
   for (int z = minZ; z <= maxZ; ++z) {
@@ -287,6 +289,7 @@ void SparseSdfVolume::applyPinchBrush(Vec3 center, float radius, float strength)
     }
   }
 
+  notifyBeforeEdit(minX, minY, minZ, maxX, maxY, maxZ);
   ConstCursor readCursor;
   Cursor writeCursor;
   for (int z = minZ; z <= maxZ; ++z) {
@@ -355,6 +358,7 @@ void SparseSdfVolume::applySmoothBrush(Vec3 center, float radius, float strength
     return region[i];
   };
 
+  notifyBeforeEdit(minX, minY, minZ, maxX, maxY, maxZ);
   Cursor writeCursor;
   ConstCursor readCursor;
   for (int z = minZ; z <= maxZ; ++z) {
@@ -432,6 +436,7 @@ void SparseSdfVolume::applyStretchBrush(const SparseSdfVolume& source,
     return (1.0f - smoothstep(0.0f, 1.0f, distToPath / radius)) * axial;
   };
 
+  notifyBeforeEdit(minX, minY, minZ, maxX, maxY, maxZ);
   ConstCursor readCursor;
   Cursor writeCursor;
   for (int z = minZ; z <= maxZ; ++z) {
@@ -503,6 +508,7 @@ void SparseSdfVolume::restoreRegion(const SparseSdfVolume& source, VoxelBounds b
   const int maxY = clampInt(bounds.max.y, minY, size_.y - 1);
   const int maxZ = clampInt(bounds.max.z, minZ, size_.z - 1);
 
+  notifyBeforeEdit(minX, minY, minZ, maxX, maxY, maxZ);
   ConstCursor sourceCursor;
   ConstCursor readCursor;
   Cursor writeCursor;
@@ -555,6 +561,51 @@ void SparseSdfVolume::markDirtyBounds(int minX, int minY, int minZ, int maxX, in
   dirtyBounds_.max.x = std::max(dirtyBounds_.max.x, next.max.x);
   dirtyBounds_.max.y = std::max(dirtyBounds_.max.y, next.max.y);
   dirtyBounds_.max.z = std::max(dirtyBounds_.max.z, next.max.z);
+}
+
+void SparseSdfVolume::notifyBeforeEdit(int minX, int minY, int minZ, int maxX, int maxY, int maxZ) {
+  if (observer_ == nullptr) {
+    return;
+  }
+  VoxelBounds bounds{};
+  bounds.valid = true;
+  bounds.min = {clampInt(minX, 0, size_.x - 1), clampInt(minY, 0, size_.y - 1), clampInt(minZ, 0, size_.z - 1)};
+  bounds.max = {clampInt(maxX, 0, size_.x - 1), clampInt(maxY, 0, size_.y - 1), clampInt(maxZ, 0, size_.z - 1)};
+  observer_->onBeforeSparseEdit(*this, bounds);
+}
+
+IVec3 SparseSdfVolume::brickCountForBounds(VoxelBounds bounds, IVec3& minBrick) const {
+  if (!bounds.valid) {
+    minBrick = {0, 0, 0};
+    return {0, 0, 0};
+  }
+  const IVec3 lo{clampInt(bounds.min.x, 0, size_.x - 1) / kBrickSize,
+                 clampInt(bounds.min.y, 0, size_.y - 1) / kBrickSize,
+                 clampInt(bounds.min.z, 0, size_.z - 1) / kBrickSize};
+  const IVec3 hi{clampInt(bounds.max.x, 0, size_.x - 1) / kBrickSize,
+                 clampInt(bounds.max.y, 0, size_.y - 1) / kBrickSize,
+                 clampInt(bounds.max.z, 0, size_.z - 1) / kBrickSize};
+  minBrick = lo;
+  return {hi.x - lo.x + 1, hi.y - lo.y + 1, hi.z - lo.z + 1};
+}
+
+const float* SparseSdfVolume::brickData(IVec3 brickIndex) const {
+  const Brick* brick = findBrick(brickIndex.x, brickIndex.y, brickIndex.z);
+  return brick == nullptr ? nullptr : brick->values.data();
+}
+
+void SparseSdfVolume::restoreBrick(IVec3 brickIndex, const float* values) {
+  const std::uint64_t key = brickKey(brickIndex.x, brickIndex.y, brickIndex.z);
+  if (values == nullptr) {
+    bricks_.erase(key);  // the brick was absent in the snapshot
+  } else {
+    Brick& brick = getOrCreateBrick(brickIndex.x, brickIndex.y, brickIndex.z);
+    std::copy_n(values, static_cast<std::size_t>(kBrickSize) * kBrickSize * kBrickSize, brick.values.data());
+  }
+  const int minX = brickIndex.x * kBrickSize;
+  const int minY = brickIndex.y * kBrickSize;
+  const int minZ = brickIndex.z * kBrickSize;
+  markDirtyBounds(minX, minY, minZ, minX + kBrickSize - 1, minY + kBrickSize - 1, minZ + kBrickSize - 1);
 }
 
 }  // namespace large::sdf

@@ -20,6 +20,16 @@
 
 namespace large::sdf {
 
+class SparseSdfVolume;
+
+// Notified with the affected voxel bounds right before a brush writes, so a
+// history can snapshot the touched bricks (including which were absent).
+class SparseEditObserver {
+ public:
+  virtual ~SparseEditObserver() = default;
+  virtual void onBeforeSparseEdit(const SparseSdfVolume& volume, VoxelBounds bounds) = 0;
+};
+
 class SparseSdfVolume {
  public:
   static constexpr int kBrickSize = 32;
@@ -70,6 +80,14 @@ class SparseSdfVolume {
     }
   }
 
+  void setEditObserver(SparseEditObserver* observer) { observer_ = observer; }
+
+  // Brick-level access used by the history: a brick's kBrickSize^3 values, or
+  // nullptr if absent; restoreBrick with nullptr removes the brick.
+  IVec3 brickCountForBounds(VoxelBounds bounds, IVec3& minBrick) const;
+  const float* brickData(IVec3 brickIndex) const;
+  void restoreBrick(IVec3 brickIndex, const float* values);
+
  private:
   struct Brick {
     std::vector<float> values;
@@ -93,12 +111,14 @@ class SparseSdfVolume {
   Brick& getOrCreateBrick(int bx, int by, int bz);
   const Brick* findBrick(int bx, int by, int bz) const;
   void markDirtyBounds(int minX, int minY, int minZ, int maxX, int maxY, int maxZ);
+  void notifyBeforeEdit(int minX, int minY, int minZ, int maxX, int maxY, int maxZ);
 
   IVec3 brickCount_{};
   IVec3 size_{};
   float voxelSize_ = 1.0f;
   Vec3 origin_{};
   float emptyValue_ = 1.0f;
+  SparseEditObserver* observer_ = nullptr;
   std::unordered_map<std::uint64_t, Brick> bricks_;
   VoxelBounds dirtyBounds_{};
 };
